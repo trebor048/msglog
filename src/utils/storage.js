@@ -98,7 +98,8 @@ export class MessageStore {
     }
 
     async storeMessagesBatch(messages, channel, withRetry, downloadAttachmentFn, processEmbedsFn, isShuttingDown) {
-        if (!messages.length || !this.db || isShuttingDown) return;
+        const shouldShutdown = typeof isShuttingDown === 'function' ? isShuttingDown() : isShuttingDown;
+        if (!messages.length || !this.db || shouldShutdown) return;
 
         const insert = this._getInsertStatement();
         if (!insert) return;
@@ -195,6 +196,41 @@ export class MessageStore {
         } catch (err) {
             console.error(chalk.red('❌ Error fetching most recent message:', err.message));
             return null;
+        }
+    }
+
+    getOldestMessage(channelId) {
+        if (!this.db) return null;
+        try {
+            const stmt = this.db.prepare('SELECT id, timestamp FROM messages WHERE channel_id = ? ORDER BY timestamp ASC LIMIT 1');
+            return stmt.get(channelId);
+        } catch (err) {
+            console.error(chalk.red('❌ Error fetching oldest message:', err.message));
+            return null;
+        }
+    }
+
+    getMessageCount(channelId) {
+        if (!this.db) return 0;
+        try {
+            const stmt = this.db.prepare('SELECT COUNT(*) as count FROM messages WHERE channel_id = ?');
+            return stmt.get(channelId)?.count || 0;
+        } catch (err) {
+            console.error(chalk.red('❌ Error counting messages:', err.message));
+            return 0;
+        }
+    }
+
+    getExistingMessageIds(channelId, messageIds) {
+        if (!this.db || !messageIds.length) return new Set();
+        try {
+            const placeholders = messageIds.map(() => '?').join(',');
+            const stmt = this.db.prepare(`SELECT id FROM messages WHERE channel_id = ? AND id IN (${placeholders})`);
+            const results = stmt.all(channelId, ...messageIds);
+            return new Set(results.map(r => r.id));
+        } catch (err) {
+            console.error(chalk.red('❌ Error checking existing messages:', err.message));
+            return new Set();
         }
     }
 }

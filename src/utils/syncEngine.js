@@ -49,6 +49,13 @@ export class SyncEngine {
                 return;
             }
 
+            // Check existing messages in database
+            const existingCount = this.messageStore.getMessageCount(channel.id);
+            if (existingCount > 0) {
+                const mostRecent = this.messageStore.getMostRecentMessage(channel.id);
+                this.jobManager.logToJob(jobId, `📦 Database has ${existingCount} messages (newest: ${mostRecent ? new Date(mostRecent.timestamp).toLocaleString() : 'unknown'})`);
+            }
+
             this.jobManager.logToJob(jobId, `Started ${direction} fetch for #${channel.name}`);
 
             while (true) {
@@ -91,9 +98,26 @@ export class SyncEngine {
 
                 if (!batch.length) break;
 
+                // Filter out messages already in database
+                const messageIds = batch.map(m => m.id);
+                const existingIds = this.messageStore.getExistingMessageIds(channel.id, messageIds);
+                const newMessages = batch.filter(m => !existingIds.has(m.id));
+
+                if (newMessages.length === 0) {
+                    this.jobManager.logToJob(jobId, `⏭️ All ${batch.length} messages already in database`);
+                    lastMessageId = messages.last().id;
+                    // Still need to continue fetching in case there are newer messages
+                    await sleepJitter(500);
+                    continue;
+                }
+
+                if (newMessages.length < batch.length) {
+                    this.jobManager.logToJob(jobId, `⏭️ Skipped ${batch.length - newMessages.length} existing messages, processing ${newMessages.length} new`);
+                }
+
                 lastMessageId = messages.last().id;
-                await this.messageStore.storeMessagesBatch(batch, channel, withRetry, this.downloadAttachmentFn, this.processEmbedsFn, isShuttingDown);
-                totalMessages += batch.length;
+                await this.messageStore.storeMessagesBatch(newMessages, channel, withRetry, this.downloadAttachmentFn, this.processEmbedsFn, isShuttingDown);
+                totalMessages += newMessages.length;
 
                 this.jobManager.updateJobStatus(jobId, 'running', totalMessages);
                 if (totalMessages % 100 === 0) this.messageStore.checkMemoryUsage();

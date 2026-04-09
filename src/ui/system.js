@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { resetStdin, formatDuration } from '../utils/utils.js';
 
-export async function showSystemInfo(statsTracker, cache, logger, loggerInstance) {
+export async function showSystemInfo(statsTracker, cache) {
     console.clear();
     const stats = statsTracker.getStats();
 
@@ -26,14 +26,6 @@ export async function showSystemInfo(statsTracker, cache, logger, loggerInstance
     console.log(`  Size: ${chalk.cyan(cacheStats.size)} / ${cacheStats.maxSize}`);
     console.log(`  Utilization: ${chalk.cyan(cacheStats.utilization)}`);
 
-    console.log(chalk.green('\n🔔 Notifications:'));
-    const notifStats = loggerInstance.getStats();
-    console.log(`  Total: ${chalk.cyan(notifStats.total)}`);
-    console.log(`  Unread: ${chalk.yellow(notifStats.unread)}`);
-    console.log(`  Success: ${chalk.green(notifStats.byType.success)}`);
-    console.log(`  Errors: ${chalk.red(notifStats.byType.error)}`);
-    console.log(`  Warnings: ${chalk.yellow(notifStats.byType.warn)}`);
-
     if (stats.lastSync) {
         console.log(chalk.green('\n🔄 Last Sync:'));
         console.log(`  Channel: ${chalk.cyan(stats.lastSync.channelId)}`);
@@ -46,33 +38,6 @@ export async function showSystemInfo(statsTracker, cache, logger, loggerInstance
         console.log(`  ${chalk.red(stats.lastError.message)}`);
         console.log(`  Time: ${chalk.cyan(stats.lastError.timestamp)}`);
     }
-
-    console.log(chalk.gray('═'.repeat(60)));
-
-    resetStdin();
-    await inquirer.prompt([{ type: 'input', name: 'continue', message: '\nPress Enter to continue...' }]);
-}
-
-export async function showNotifications(logger) {
-    console.clear();
-    const notifs = logger.getNotifications();
-
-    if (!notifs.length) {
-        console.log(chalk.yellow('No notifications'));
-        return;
-    }
-
-    console.log(chalk.cyan('🔔 Notifications\n'));
-    console.log(chalk.gray('═'.repeat(60)));
-
-    notifs.slice(-20).reverse().forEach(n => {
-        const icon = n.read ? '  ' : '🔴';
-        const color = n.type === 'error' ? chalk.red : n.type === 'warning' ? chalk.yellow : chalk.green;
-        console.log(`${icon} ${color(n.title)}`);
-        console.log(`   ${n.data ? JSON.stringify(n.data) : ''}`);
-        console.log(`   ${chalk.gray(n.timestamp)}`);
-        console.log();
-    });
 
     console.log(chalk.gray('═'.repeat(60)));
 

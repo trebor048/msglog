@@ -5,7 +5,8 @@ import { showLiveJobMonitor } from './views.js';
 import { viewChannelStats } from './views.js';
 import { showConfigMenu, manageChannels, viewChannels } from './management.js';
 import { showSearchMenu, showExportMenu, showDatabaseMenu } from './advanced.js';
-import { showSystemInfo, showNotifications, showCacheInfo } from './system.js';
+import { showSystemInfo, showCacheInfo } from './system.js';
+import { startAutoSync, stopAutoSync } from '../utils/index.js';
 
 export async function mainMenu(ctx) {
     try {
@@ -30,6 +31,10 @@ export async function mainMenu(ctx) {
                     chalk.red(`🔴 Failed: ${failed.length}`)
                 );
 
+            if (ctx.autoSyncEnabled) {
+                console.log(chalk.cyan(`🔄 Autosync: ${ctx.autoSyncEnabled ? 'ON' : 'OFF'}`));
+            }
+
             console.log(chalk.gray('═'.repeat(58)));
             console.log(chalk.cyan('💡 Arrow Keys: Navigate // Enter: Select // Ctrl+C: Exit'));
             console.log(chalk.gray('═'.repeat(58)));
@@ -45,13 +50,13 @@ export async function mainMenu(ctx) {
                     '📡 Manage Channels',
                     ctx.isPaused ? '▶️ Resume' : '⏸️ Pause',
                     '🚀 Sync All',
+                    ctx.autoSyncEnabled ? '⏹️ Disable Autosync' : '🔄 Enable Autosync',
                     '📊 Stats',
                     '📋 Live Monitor',
                     '🔍 Search Messages',
                     '📤 Export Data',
                     '🗄️ Database Manager',
                     '💻 System Info',
-                    '🔔 Notifications',
                     '⚙️ Config',
                     '🏥 Health Check',
                     '❌ Exit'
@@ -81,6 +86,22 @@ export async function mainMenu(ctx) {
                         } else {
                             console.log(chalk.yellow('ℹ️ No channels listening — use Manage Channels first'));
                             await sleep(1500);
+                        }
+                    }
+                    break;
+
+                case '🔄 Enable Autosync':
+                case '⏹️ Disable Autosync':
+                    if (ctx.autoSyncEnabled) {
+                        stopAutoSync(ctx);
+                        await sleep(1000);
+                    } else {
+                        if (!ctx.listeningChannels.size) {
+                            console.log(chalk.yellow('⚠️ No channels listening — add channels first'));
+                            await sleep(2000);
+                        } else {
+                            startAutoSync(ctx);
+                            await sleep(1000);
                         }
                     }
                     break;
@@ -127,11 +148,7 @@ export async function mainMenu(ctx) {
                     break;
 
                 case '💻 System Info':
-                    await showSystemInfo(ctx.performance, ctx.performance, ctx.logger, ctx.logger);
-                    break;
-
-                case '🔔 Notifications':
-                    await showNotifications(ctx.logger);
+                    await showSystemInfo(ctx.performance, ctx.performance);
                     break;
 
                 case '⚙️ Config':

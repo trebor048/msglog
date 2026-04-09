@@ -30,16 +30,6 @@ export const resetStdin = () => {
     }
 };
 
-// Safe async wrapper with error handling
-export const safeAsync = (fn, fallback = null) => async (...args) => {
-    try {
-        return await fn(...args);
-    } catch (err) {
-        console.error(`Error in ${fn.name}:`, err.message);
-        return fallback;
-    }
-};
-
 // Validation utilities
 export class Validator {
     static isValidDate(dateString) {
@@ -52,37 +42,6 @@ export class Validator {
             return false;
         }
         return new Date(startDate) <= new Date(endDate);
-    }
-
-    static isValidChannelId(id) {
-        return /^\d+$/.test(id);
-    }
-
-    static isValidUserId(id) {
-        return /^\d+$/.test(id);
-    }
-
-    static isValidMessageId(id) {
-        return /^\d+$/.test(id);
-    }
-
-    static isValidUrl(url) {
-        try {
-            new URL(url);
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    static isValidFilename(filename) {
-        const invalidChars = /[<>:"|?*\x00-\x1f]/g;
-        return !invalidChars.test(filename) && filename.length > 0 && filename.length <= 255;
-    }
-
-    static isValidEmail(email) {
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        return emailRegex.test(email);
     }
 
     static sanitizeFilename(filename) {
@@ -121,11 +80,6 @@ export class Validator {
             valid: errors.length === 0,
             errors
         };
-    }
-
-    static validateExportFormat(format) {
-        const validFormats = ['json', 'csv', 'html', 'backup'];
-        return validFormats.includes(format.toLowerCase());
     }
 
     static validateConfig(config) {

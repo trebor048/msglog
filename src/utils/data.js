@@ -541,7 +541,10 @@ export class DatabaseManager {
 
     getTableInfo() {
         try {
-            const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+            // Filter out SQLite internal tables
+            const tables = this.db.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).all();
             const info = {};
 
             for (const table of tables) {
@@ -579,6 +582,73 @@ export class DatabaseManager {
         } catch (err) {
             console.error(chalk.red('❌ Rebuild error:', err.message));
             return false;
+        }
+    }
+
+    deduplicateMessages() {
+        try {
+            console.log(chalk.blue('🧹 Deduplicating messages...'));
+            
+            // Drop any leftover temp tables - use separate statements
+            try {
+                this.db.prepare('DROP TABLE IF EXISTS messages_new').run();
+            } catch { }
+            try {
+                this.db.prepare('DROP TABLE IF EXISTS messages_backup').run();
+            } catch { }
+            
+            // Get count before
+            const countBefore = this.db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
+            
+            // Backup original table
+            this.db.prepare('CREATE TABLE messages_backup AS SELECT * FROM messages').run();
+            
+            // Drop original and recreate with PRIMARY KEY and DISTINCT
+            this.db.prepare('DROP TABLE messages').run();
+            this.db.prepare(`
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    author_id TEXT,
+                    author_tag TEXT,
+                    content TEXT,
+                    timestamp DATETIME,
+                    channel_id TEXT,
+                    attachments TEXT,
+                    embeds TEXT,
+                    reference_message_id TEXT,
+                    reference_message_content TEXT,
+                    reactions TEXT DEFAULT '[]',
+                    is_bot INTEGER DEFAULT 0,
+                    deleted INTEGER DEFAULT 0,
+                    edited_at DATETIME
+                )
+            `).run();
+            
+            this.db.prepare('INSERT INTO messages SELECT DISTINCT * FROM messages_backup').run();
+            this.db.prepare('DROP TABLE messages_backup').run();
+            this.db.prepare('CREATE INDEX IF NOT EXISTS idx_channel_id ON messages (channel_id)').run();
+            this.db.prepare('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages (timestamp)').run();
+            
+            // Get count after
+            const countAfter = this.db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
+            const removed = countBefore - countAfter;
+            
+            console.log(chalk.green(`✅ Deduplication complete: ${countBefore} → ${countAfter} messages (removed ${removed})`));
+            
+            // Optimize
+            this.db.prepare('VACUUM').run();
+            this.db.prepare('ANALYZE').run();
+            
+            return removed;
+        } catch (err) {
+            console.error(chalk.red('❌ Deduplication error:', err.message));
+            // Try to restore from backup if it exists
+            try {
+                this.db.prepare('DROP TABLE IF EXISTS messages').run();
+                this.db.prepare('ALTER TABLE messages_backup RENAME TO messages').run();
+                console.log(chalk.yellow('⚠️ Restored from backup'));
+            } catch { }
+            return 0;
         }
     }
 }

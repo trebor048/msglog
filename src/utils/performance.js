@@ -23,24 +23,6 @@ export class PerformanceManager {
         };
     }
 
-    // Health check methods
-    getUptime() {
-        return Date.now() - this.startTime;
-    }
-
-    getHealthStatus(jobManager, circuitBreaker, listeningChannels) {
-        return {
-            uptime: this.getUptime(),
-            totalMessages: this.stats.totalMessagesFetched,
-            totalJobs: this.stats.totalSyncs,
-            totalErrors: this.stats.totalErrors,
-            activeJobs: jobManager.activeJobs.size,
-            circuitBreaker: circuitBreaker.getStatus(),
-            memoryUsage: process.memoryUsage(),
-            activeChannels: listeningChannels.size
-        };
-    }
-
     // Cache methods
     cacheSet(key, value, ttl = null) {
         if (this.cache.size >= this.maxCacheSize) {
@@ -94,73 +76,18 @@ export class PerformanceManager {
         };
     }
 
-    cacheCleanup() {
-        const now = Date.now();
-        let removed = 0;
-
-        for (const [key, item] of this.cache.entries()) {
-            if (item.ttl && now > item.ttl) {
-                this.cache.delete(key);
-                this.accessOrder = this.accessOrder.filter(k => k !== key);
-                removed++;
-            }
-        }
-
-        return removed;
-    }
-
-    // Stats methods
-    recordMessageFetch(count) {
-        this.stats.totalMessagesFetched += count;
-    }
-
-    recordMessageStore(count) {
-        this.stats.totalMessagesStored += count;
-    }
-
-    recordAttachmentDownload() {
-        this.stats.totalAttachmentsDownloaded++;
-    }
-
-    recordError(error) {
-        this.stats.totalErrors++;
-        this.stats.lastError = {
-            message: error.message,
-            timestamp: new Date().toISOString()
+    // Health check
+    getHealthStatus(jobManager, circuitBreaker, listeningChannels) {
+        return {
+            uptime: Date.now() - this.startTime,
+            totalMessages: this.stats.totalMessagesFetched,
+            totalJobs: this.stats.totalSyncs,
+            totalErrors: this.stats.totalErrors,
+            activeJobs: jobManager.activeJobs.size,
+            circuitBreaker: circuitBreaker.getStatus(),
+            memoryUsage: process.memoryUsage(),
+            activeChannels: listeningChannels.size
         };
-    }
-
-    recordSync(channelId, messageCount) {
-        this.stats.totalSyncs++;
-        this.stats.lastSync = {
-            channelId,
-            messageCount,
-            timestamp: new Date().toISOString()
-        };
-
-        if (!this.stats.channelStats.has(channelId)) {
-            this.stats.channelStats.set(channelId, { syncs: 0, messages: 0 });
-        }
-
-        const ch = this.stats.channelStats.get(channelId);
-        ch.syncs++;
-        ch.messages += messageCount;
-    }
-
-    recordSearch() {
-        this.stats.totalSearches++;
-    }
-
-    recordExport() {
-        this.stats.totalExports++;
-    }
-
-    recordAuthor(authorId, authorTag) {
-        if (!this.stats.authorStats.has(authorId)) {
-            this.stats.authorStats.set(authorId, { tag: authorTag, messages: 0 });
-        }
-        const author = this.stats.authorStats.get(authorId);
-        author.messages++;
     }
 
     getStats() {

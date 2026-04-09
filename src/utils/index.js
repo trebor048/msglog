@@ -11,15 +11,42 @@ import { SyncEngine } from './syncEngine.js';
 import { setupEventHandlers, setupShutdownHandlers, createGracefulShutdown } from './lifecycle.js';
 import { mainMenu } from '../ui/menu.js';
 import { MessageSearch, MessageExporter, DatabaseManager } from './data.js';
-import { Logger } from './logger.js';
 import { PerformanceManager } from './performance.js';
 import { Validator } from './utils.js';
 
 dotenv.config();
 
+// Autosync helper functions
+function startAutoSync(ctx) {
+    if (ctx.autoSyncEnabled || !ctx.listeningChannels.size) return;
+    
+    ctx.autoSyncEnabled = true;
+    console.log(chalk.green(`✅ Autosync enabled (every ${ctx.autoSyncIntervalMs / 1000 / 60} minutes)`));
+    
+    ctx.autoSyncInterval = setInterval(async () => {
+        if (ctx.isShuttingDown || ctx.isPaused) return;
+        
+        const running = ctx.jobManager.getAllJobs().filter(j => j.status === 'running');
+        if (running.length >= ctx.config.maxConcurrentJobs) return;
+        
+        await ctx.syncEngine.syncAllChannelsParallel(ctx.client, ctx.listeningChannels, ctx.withRetry, ctx.isShuttingDown);
+    }, ctx.autoSyncIntervalMs);
+}
+
+function stopAutoSync(ctx) {
+    if (!ctx.autoSyncEnabled) return;
+    
+    ctx.autoSyncEnabled = false;
+    if (ctx.autoSyncInterval) {
+        clearInterval(ctx.autoSyncInterval);
+        ctx.autoSyncInterval = null;
+    }
+    console.log(chalk.yellow('⏹️ Autosync disabled'));
+}
+
 // Application context container - reduces parameter passing
 class AppContext {
-    constructor(config, client, db, jobManager, syncEngine, performance, circuitBreaker, listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager, logger) {
+    constructor(config, client, db, jobManager, syncEngine, performance, circuitBreaker, listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager) {
         this.config = config;
         this.client = client;
         this.db = db;
@@ -33,9 +60,11 @@ class AppContext {
         this.search = search;
         this.exporter = exporter;
         this.dbManager = dbManager;
-        this.logger = logger;
         this.isPaused = false;
         this.isShuttingDown = false;
+        this.autoSyncEnabled = false;
+        this.autoSyncInterval = null;
+        this.autoSyncIntervalMs = 60 * 60 * 1000; // 1 hour default
     }
 }
 
@@ -80,7 +109,6 @@ async function bootstrap() {
         const search = new MessageSearch(db);
         const exporter = new MessageExporter(db);
         const dbManager = new DatabaseManager(db);
-        const logger = new Logger();
         const performance = new PerformanceManager(config.maxCacheSize);
 
         // Create graceful shutdown handler
@@ -90,7 +118,7 @@ async function bootstrap() {
         // Create application context
         const ctx = new AppContext(
             config, client, db, jobManager, syncEngine, performance, circuitBreaker,
-            listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager, logger
+            listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager
         );
 
         // Setup shutdown handlers
@@ -108,7 +136,7 @@ async function bootstrap() {
                     processEmbeds(embeds, channelId, 
                         (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId), 
                         config, messageId),
-                ctx.isShuttingDown
+                () => ctx.isShuttingDown
             );
         };
 
@@ -117,13 +145,12 @@ async function bootstrap() {
 
         // Login and start
         client.login(process.env.USER_TOKEN).catch(err => {
-            logger.error('Login failed', err);
+            console.error(chalk.red('❌ Login failed:', err.message));
             process.exit(1);
         });
 
         client.once('ready', () => {
             console.log(chalk.green(`✅ Logged in as ${client.user.tag}`));
-            logger.success('Bot Ready', `Logged in as ${client.user.tag}`);
             mainMenu(ctx);
         });
 
@@ -134,3 +161,5 @@ async function bootstrap() {
 }
 
 bootstrap();
+
+export { startAutoSync, stopAutoSync };

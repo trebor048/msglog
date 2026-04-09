@@ -204,6 +204,7 @@ export async function showDatabaseMenu(dbManager) {
             '✅ Check Integrity',
             '🧹 Cleanup Old Data',
             '🔨 Rebuild Indexes',
+            '🧽 Deduplicate Messages',
             '📋 View Table Info',
             '⬅️ Back'
         ]
@@ -273,6 +274,23 @@ export async function showDatabaseMenu(dbManager) {
         case '🔨 Rebuild Indexes': {
             dbManager.rebuildIndexes();
             await sleep(1000);
+            break;
+        }
+
+        case '🧽 Deduplicate Messages': {
+            resetStdin();
+            const { confirm } = await inquirer.prompt([{
+                type: 'confirm',
+                name: 'confirm',
+                message: 'Remove duplicate messages? This keeps the first occurrence of each message ID.',
+                default: false
+            }]);
+
+            if (confirm) {
+                const removed = dbManager.deduplicateMessages();
+                console.log(chalk.green(`✅ Removed ${removed} duplicate messages`));
+                await sleep(1500);
+            }
             break;
         }
 
