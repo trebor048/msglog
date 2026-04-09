@@ -1,7 +1,7 @@
 # Environment and Secrets
 .env
 config.json
-
+*.md
 # Databases and SQLite artifacts
 *.db
 *.db-journal
