@@ -1,0 +1,15 @@
+{
+  "databaseFile": "messages.db",
+  "globalDelay": 200,
+  "maxFastRequests": 15,
+  "randomDelayMin": 100,
+  "randomDelayMax": 600,
+  "downloadAttachments": false,
+  "downloadTimeoutSeconds": 300,
+  "retryAttempts": 3,
+  "retryBaseDelayMs": 800,
+  "maxConcurrentJobs": 5,
+  "maxCacheSize": 10000,
+  "maxFailedReferences": 5000,
+  "maxReferenceCache": 10000
+}

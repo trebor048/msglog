@@ -1,0 +1,23 @@
+# Environment and Secrets
+.env
+config.json
+
+# Databases and SQLite artifacts
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Dependency Directories
+node_modules/
+dist/
+build/
+
+# Logs and Debugging
+logs/
+*.log
+npm-debug.log*
+
+# OS specific files
+.DS_Store
+Thumbs.db
