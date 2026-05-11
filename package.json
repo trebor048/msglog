@@ -2,7 +2,7 @@
   "name": "msg-log",
   "version": "1.0.0",
   "description": "discord message logger",
-  "main": "bot.js",
+  "main": "main.js",
   "type": "module",
   "scripts": {
     "start": "node main.js",
@@ -21,10 +21,11 @@
   "dependencies": {
     "axios": "^1.6.8",
     "better-sqlite3": "^12.8.0",
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0",
     "chalk": "^5.3.0",
     "discord.js-selfbot-v13": "^3.5.1",
     "dotenv": "^16.4.5",
-    "inquirer": "^12.9.6",
     "moment": "^2.30.1"
   },
   "engines": {

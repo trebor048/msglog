@@ -9,9 +9,10 @@ import { JobManager } from './jobManager.js';
 import { MessageStore, downloadAttachment, processEmbeds } from './storage.js';
 import { SyncEngine } from './syncEngine.js';
 import { setupEventHandlers, setupShutdownHandlers, createGracefulShutdown } from './lifecycle.js';
-import { mainMenu } from '../ui/menu.js';
+import startBlessedTUI from '../blessed-tui/index.js';
 import { MessageSearch, MessageExporter, DatabaseManager } from './data.js';
 import { PerformanceManager } from './performance.js';
+import { Logger } from './logger.js';
 import { Validator } from './utils.js';
 
 dotenv.config();
@@ -22,15 +23,20 @@ function startAutoSync(ctx) {
     
     ctx.autoSyncEnabled = true;
     console.log(chalk.green(`✅ Autosync enabled (every ${ctx.autoSyncIntervalMs / 1000 / 60} minutes)`));
-    
-    ctx.autoSyncInterval = setInterval(async () => {
+
+    const runSync = async () => {
         if (ctx.isShuttingDown || ctx.isPaused) return;
         
         const running = ctx.jobManager.getAllJobs().filter(j => j.status === 'running');
         if (running.length >= ctx.config.maxConcurrentJobs) return;
         
-        await ctx.syncEngine.syncAllChannelsParallel(ctx.client, ctx.listeningChannels, ctx.withRetry, ctx.isShuttingDown);
-    }, ctx.autoSyncIntervalMs);
+        await ctx.syncEngine.syncAllChannelsParallel(ctx.client, ctx.listeningChannels, ctx.withRetry, ctx.isShuttingDown, () => ctx.isPaused);
+    };
+
+    // Run immediately on startup
+    runSync();
+    
+    ctx.autoSyncInterval = setInterval(runSync, ctx.autoSyncIntervalMs);
 }
 
 function stopAutoSync(ctx) {
@@ -46,7 +52,11 @@ function stopAutoSync(ctx) {
 
 // Application context container - reduces parameter passing
 class AppContext {
-    constructor(config, client, db, jobManager, syncEngine, performance, circuitBreaker, listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager) {
+    constructor(options) {
+        const {
+            config, client, db, jobManager, syncEngine, performance, circuitBreaker,
+            listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager, logger
+        } = options;
         this.config = config;
         this.client = client;
         this.db = db;
@@ -60,6 +70,7 @@ class AppContext {
         this.search = search;
         this.exporter = exporter;
         this.dbManager = dbManager;
+        this.logger = logger;
         this.isPaused = false;
         this.isShuttingDown = false;
         this.autoSyncEnabled = false;
@@ -95,34 +106,47 @@ async function bootstrap() {
 
         // Initialize managers and stores
         const jobManager = new JobManager();
-        const messageStore = new MessageStore(db, config);
-        
+        const performance = new PerformanceManager();
+        const logger = new Logger();
+        const dbManager = new DatabaseManager(db, performance);
+        const messageStore = new MessageStore(db, config, performance);
+
+        // Load persisted state
+        const listeningChannels = dbManager.loadListeningChannels();
+        const autoSyncSettings = dbManager.loadAutoSync();
+
         // Create wrapped functions for SyncEngine
         const wrappedDownloadAttachment = (url, channelId, filename, messageId, size) =>
             downloadAttachment(url, channelId, filename, withRetry, config, messageId, size);
         const wrappedProcessEmbeds = (embeds, channelId, messageId) =>
-            processEmbeds(embeds, channelId, 
-                (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId), 
+            processEmbeds(embeds, channelId,
+                (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId),
                 config, messageId);
-        
-        const syncEngine = new SyncEngine(jobManager, messageStore, rateLimiter, config, wrappedDownloadAttachment, wrappedProcessEmbeds);
-        const search = new MessageSearch(db);
-        const exporter = new MessageExporter(db);
-        const dbManager = new DatabaseManager(db);
-        const performance = new PerformanceManager(config.maxCacheSize);
 
-        // Create graceful shutdown handler
-        const listeningChannels = new Set();
-        const gracefulShutdown = await createGracefulShutdown(client, db, jobManager, false, false);
+        const syncEngine = new SyncEngine(jobManager, messageStore, rateLimiter, config, wrappedDownloadAttachment, wrappedProcessEmbeds, performance);
+        const search = new MessageSearch(db, performance);
+        const exporter = new MessageExporter(db, performance);
 
-        // Create application context
-        const ctx = new AppContext(
+        const ctx = new AppContext({
             config, client, db, jobManager, syncEngine, performance, circuitBreaker,
-            listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager
-        );
+            listeningChannels, withRetry, gracefulShutdown: null, search, exporter, dbManager, logger
+        });
+
+        ctx.autoSyncIntervalMs = autoSyncSettings.intervalMs || 60 * 60 * 1000;
+
+        const gracefulShutdown = await createGracefulShutdown(client, db, jobManager, ctx, logger);
+        ctx.gracefulShutdown = gracefulShutdown;
+
+        // Wire up Discord rate-limit events to adaptive rate limiter
+        client.on('rateLimit', info => {
+            const match = info.path?.match(/\/channels\/(\d+)\/messages/);
+            const channelId = match ? match[1] : 'global';
+            const timeout = info.timeout ?? info.time ?? 0;
+            rateLimiter.updateFromRateLimit(channelId, timeout, info.global);
+        });
 
         // Setup shutdown handlers
-        setupShutdownHandlers(client, db, jobManager, false, gracefulShutdown);
+        setupShutdownHandlers(client, db, jobManager, ctx, gracefulShutdown);
 
         // Create dependency-injected store function
         const storeMessagesWithDeps = async (messages, channel) => {
@@ -130,28 +154,37 @@ async function bootstrap() {
                 messages,
                 channel,
                 withRetry,
-                (url, channelId, filename, messageId, size) => 
+                (url, channelId, filename, messageId, size) =>
                     downloadAttachment(url, channelId, filename, withRetry, config, messageId, size),
-                (embeds, channelId, messageId) => 
-                    processEmbeds(embeds, channelId, 
-                        (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId), 
+                (embeds, channelId, messageId) =>
+                    processEmbeds(embeds, channelId,
+                        (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId),
                         config, messageId),
                 () => ctx.isShuttingDown
             );
         };
 
         // Setup event handlers
-        setupEventHandlers(client, listeningChannels, messageStore, ctx.isPaused, storeMessagesWithDeps);
+        setupEventHandlers(client, listeningChannels, messageStore, () => ctx.isPaused, storeMessagesWithDeps, logger);
 
         // Login and start
         client.login(process.env.USER_TOKEN).catch(err => {
             console.error(chalk.red('❌ Login failed:', err.message));
+            logger?.error('Login failed', { error: err.message });
             process.exit(1);
         });
 
         client.once('ready', () => {
             console.log(chalk.green(`✅ Logged in as ${client.user.tag}`));
-            mainMenu(ctx);
+            if (autoSyncSettings.enabled && listeningChannels.size) {
+                startAutoSync(ctx);
+            }
+            // Use new Blessed-based TUI
+            startBlessedTUI(ctx).catch(err => {
+                console.error(chalk.red('❌ TUI error:', err.message));
+                logger?.error('TUI error', { error: err.message });
+                gracefulShutdown('tui error');
+            });
         });
 
     } catch (err) {

@@ -1,17 +1,25 @@
 import chalk from 'chalk';
 import fs from 'fs/promises';
+import { statSync } from 'fs';
 import path from 'path';
+import { getSetting, setSetting } from './setup.js';
+import { Spinner, ProgressBar } from './utils.js';
 
 // ============ MESSAGE SEARCH ============
 export class MessageSearch {
-    constructor(db) {
+    constructor(db, performance = null) {
         this.db = db;
+        this.performance = performance;
         this.preparedStatements = new Map();
+        this._statsStmt = null;
+        this._statsChannelStmt = null;
+        this._topAuthorsStmt = null;
+        this._topAuthorsChannelStmt = null;
     }
 
     // Query builder with prepared statement caching
     _buildQuery(filters) {
-        const conditions = [];
+        const conditions = ['deleted = 0'];
         const params = [];
 
         if (filters.query) {
@@ -101,13 +109,70 @@ export class MessageSearch {
         const mergedFilters = { ...defaults, ...filters };
 
         try {
+            // Use FTS5 for keyword searches — much faster than LIKE on large DBs
+            if (mergedFilters.query && mergedFilters.query.trim()) {
+                return this._ftsSearch(mergedFilters);
+            }
             const { sql, params } = this._buildQuery(mergedFilters);
             const stmt = this._getPreparedStatement(sql);
-            return stmt.all(...params);
+            const results = stmt.all(...params);
+            if (this.performance) this.performance.stats.totalSearches++;
+            return results;
         } catch (err) {
-            console.error(chalk.red('❌ Search error:', err.message));
-            return [];
+            // FTS may not exist on older DBs — fall back to LIKE search
+            try {
+                const { sql, params } = this._buildQuery(mergedFilters);
+                const stmt = this._getPreparedStatement(sql);
+                return stmt.all(...params);
+            } catch {
+                return [];
+            }
         }
+    }
+
+    _ftsSearch(filters) {
+        // Escape FTS5 special characters so user input is treated as a literal phrase
+        const term = filters.query.trim().replace(/"/g, '""');
+        const params = [`"${term}"`];
+        const extraConditions = ['m.deleted = 0'];
+
+        if (filters.channelId) {
+            extraConditions.push('m.channel_id = ?');
+            params.push(filters.channelId);
+        }
+        if (filters.authorId) {
+            extraConditions.push('m.author_id = ?');
+            params.push(filters.authorId);
+        }
+        if (filters.startDate) {
+            extraConditions.push('m.timestamp >= ?');
+            params.push(filters.startDate);
+        }
+        if (filters.endDate) {
+            extraConditions.push('m.timestamp <= ?');
+            params.push(filters.endDate);
+        }
+
+        params.push(filters.limit || 100);
+
+        const where = extraConditions.length
+            ? `AND ${extraConditions.join(' AND ')}`
+            : '';
+
+        // Join via rowid — FTS5 content tables expose rowid which maps to messages.rowid
+        const sql = `
+            SELECT m.*
+            FROM messages_fts
+            JOIN messages m ON m.rowid = messages_fts.rowid
+            WHERE messages_fts MATCH ?
+            ${where}
+            ORDER BY m.timestamp DESC
+            LIMIT ?
+        `;
+
+        const results = this.db.prepare(sql).all(...params);
+        if (this.performance) this.performance.stats.totalSearches++;
+        return results;
     }
 
     getStats(channelId = null) {
@@ -126,10 +191,16 @@ export class MessageSearch {
 
         if (channelId) {
             sql += ' WHERE channel_id = ?';
-            return this.db.prepare(sql).get(channelId);
+            if (!this._statsChannelStmt) {
+                this._statsChannelStmt = this.db.prepare(sql);
+            }
+            return this._statsChannelStmt.get(channelId);
         }
 
-        return this.db.prepare(sql).get();
+        if (!this._statsStmt) {
+            this._statsStmt = this.db.prepare(sql);
+        }
+        return this._statsStmt.get();
     }
 
     getTopAuthors(limit = 10, channelId = null) {
@@ -141,17 +212,27 @@ export class MessageSearch {
 
         if (channelId) {
             sql += ` AND channel_id = ?`;
+            sql += ` GROUP BY author_id, author_tag
+                     ORDER BY message_count DESC
+                     LIMIT ?`;
+            if (!this._topAuthorsChannelStmt) {
+                this._topAuthorsChannelStmt = this.db.prepare(sql);
+            }
+            return this._topAuthorsChannelStmt.all(channelId, limit);
         }
 
-        sql += ` GROUP BY author_id
+        sql += ` GROUP BY author_id, author_tag
                  ORDER BY message_count DESC
                  LIMIT ?`;
-
-        const params = channelId ? [channelId, limit] : [limit];
-        return this.db.prepare(sql).all(...params);
+        if (!this._topAuthorsStmt) {
+            this._topAuthorsStmt = this.db.prepare(sql);
+        }
+        return this._topAuthorsStmt.all(limit);
     }
 
     getMessagesByDate(startDate, endDate, channelId = null) {
+        // Dynamic SQL - can't cache prepared statement due to conditional WHERE clause
+        // This is called infrequently so acceptable
         let sql = `
             SELECT 
                 DATE(timestamp) as date,
@@ -171,10 +252,14 @@ export class MessageSearch {
         sql += ` GROUP BY DATE(timestamp)
                  ORDER BY date ASC`;
 
-        return this.db.prepare(sql).all(...params);
+        const stmt = this.db.prepare(sql);
+        const result = stmt.all(...params);
+        return result;
     }
 
     findDuplicates(channelId = null) {
+        // Dynamic SQL - can't cache prepared statement due to conditional WHERE clause
+        // This is called infrequently so acceptable
         let sql = `
             SELECT 
                 m1.id, m1.author_tag, m1.content, m1.timestamp,
@@ -196,20 +281,25 @@ export class MessageSearch {
             ORDER BY duplicate_count DESC
         `;
 
-        return this.db.prepare(sql).all(...params);
+        const stmt = this.db.prepare(sql);
+        const result = stmt.all(...params);
+
+        return result;
     }
 }
 
 // ============ MESSAGE EXPORTER ============
 export class MessageExporter {
-    constructor(db) {
+    constructor(db, performance = null) {
         this.db = db;
+        this.performance = performance;
     }
 
     async exportToJSON(filename, filters = {}) {
         try {
             const sql = this._buildFilteredQuery(filters);
-            const messages = this.db.prepare(sql).all(...this._getFilterParams(filters));
+            const stmt = this.db.prepare(sql);
+            const messages = stmt.all(...this._getFilterParams(filters));
 
             const data = {
                 exportDate: new Date().toISOString(),
@@ -227,10 +317,15 @@ export class MessageExporter {
             await fs.mkdir('exports', { recursive: true });
             await fs.writeFile(filepath, JSON.stringify(data, null, 2));
 
+            if (this.performance) this.performance.stats.totalExports++;
             console.log(chalk.green(`✅ Exported ${messages.length} messages to ${filepath}`));
             return filepath;
         } catch (err) {
             console.error(chalk.red('❌ Export error:', err.message));
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             throw err;
         }
     }
@@ -238,12 +333,14 @@ export class MessageExporter {
     async exportToCSV(filename, filters = {}) {
         try {
             const sql = this._buildFilteredQuery(filters);
-            const messages = this.db.prepare(sql).all(...this._getFilterParams(filters));
+            const stmt = this.db.prepare(sql);
+            const messages = stmt.all(...this._getFilterParams(filters));
+
 
             const headers = ['ID', 'Author', 'Content', 'Timestamp', 'Channel', 'Attachments', 'Reactions', 'Edited', 'Deleted'];
             const rows = messages.map(m => [
                 m.id,
-                m.author_tag,
+                `"${(m.author_tag || '').replace(/"/g, '""')}"`,
                 `"${(m.content || '').replace(/"/g, '""')}"`,
                 m.timestamp,
                 m.channel_id,
@@ -259,10 +356,15 @@ export class MessageExporter {
             await fs.mkdir('exports', { recursive: true });
             await fs.writeFile(filepath, csv);
 
+            if (this.performance) this.performance.stats.totalExports++;
             console.log(chalk.green(`✅ Exported ${messages.length} messages to ${filepath}`));
             return filepath;
         } catch (err) {
             console.error(chalk.red('❌ Export error:', err.message));
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             throw err;
         }
     }
@@ -270,7 +372,9 @@ export class MessageExporter {
     async exportToHTML(filename, filters = {}) {
         try {
             const sql = this._buildFilteredQuery(filters);
-            const messages = this.db.prepare(sql).all(...this._getFilterParams(filters));
+            const stmt = this.db.prepare(sql);
+            const messages = stmt.all(...this._getFilterParams(filters));
+
 
             const html = `
 <!DOCTYPE html>
@@ -296,18 +400,22 @@ export class MessageExporter {
         <p>Exported: ${new Date().toLocaleString()}</p>
         <p>Total Messages: ${messages.length}</p>
     </div>
-    ${messages.map(m => `
+    ${messages.map(m => {
+        const attachments = JSON.parse(m.attachments || '[]');
+        const reactions = JSON.parse(m.reactions || '[]');
+        return `
     <div class="message">
-        <div><span class="author">${m.author_tag}</span> <span class="timestamp">${new Date(m.timestamp).toLocaleString()}</span></div>
+        <div><span class="author">${this._escapeHTML(m.author_tag)}</span> <span class="timestamp">${new Date(m.timestamp).toLocaleString()}</span></div>
         <div class="content">${this._escapeHTML(m.content)}</div>
         <div class="meta">
             ${m.edited_at ? `<span class="edited">Edited: ${new Date(m.edited_at).toLocaleString()}</span>` : ''}
             ${m.deleted ? '<span class="deleted">Deleted</span>' : ''}
-            ${JSON.parse(m.attachments || '[]').length > 0 ? `<span>📎 ${JSON.parse(m.attachments).length} attachment(s)</span>` : ''}
-            ${JSON.parse(m.reactions || '[]').length > 0 ? `<span>👍 ${JSON.parse(m.reactions).length} reaction(s)</span>` : ''}
+            ${attachments.length > 0 ? `<span>📎 ${attachments.length} attachment(s)</span>` : ''}
+            ${reactions.length > 0 ? `<span>👍 ${reactions.length} reaction(s)</span>` : ''}
         </div>
     </div>
-    `).join('')}
+    `;
+    }).join('')}
 </body>
 </html>
             `;
@@ -316,10 +424,15 @@ export class MessageExporter {
             await fs.mkdir('exports', { recursive: true });
             await fs.writeFile(filepath, html);
 
+            if (this.performance) this.performance.stats.totalExports++;
             console.log(chalk.green(`✅ Exported ${messages.length} messages to ${filepath}`));
             return filepath;
         } catch (err) {
             console.error(chalk.red('❌ Export error:', err.message));
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             throw err;
         }
     }
@@ -332,9 +445,9 @@ export class MessageExporter {
 
             await fs.mkdir('backups', { recursive: true });
 
-            const dbPath = this.db.name;
-            const data = await fs.readFile(dbPath);
-            await fs.writeFile(backupPath, data);
+            // VACUUM INTO creates a consistent snapshot without long-lived locks
+            const stmt = this.db.prepare(`VACUUM INTO ?`);
+            stmt.run(backupPath);
 
             console.log(chalk.green(`✅ Database backed up to ${backupPath}`));
             return backupPath;
@@ -357,6 +470,9 @@ export class MessageExporter {
         if (filters.isBot === false) sql += ' AND is_bot = 0';
 
         sql += ' ORDER BY timestamp DESC';
+
+        const limit = filters.limit || 10_000;
+        sql += ` LIMIT ${Math.max(1, Math.min(limit, 100_000))}`;
         return sql;
     }
 
@@ -384,8 +500,54 @@ export class MessageExporter {
 
 // ============ DATABASE MANAGER ============
 export class DatabaseManager {
-    constructor(db) {
+    constructor(db, performance = null) {
         this.db = db;
+        this.performance = performance;
+        this._statsStmt = null;
+        this._attachReactStmt = null;
+        this._pageCountStmt = null;
+        this._pageSizeStmt = null;
+        this._channelStatsStmt = null;
+        this._channelStatsAllStmt = null;
+        this._integrityStmt = null;
+        this._cleanupStmt = null;
+        this._tablesStmt = null;
+        this._indexesStmt = null;
+    }
+
+    loadListeningChannels() {
+        try {
+            const value = getSetting(this.db, 'listeningChannels', []);
+            return new Set(Array.isArray(value) ? value : []);
+        } catch {
+            return new Set();
+        }
+    }
+
+    saveListeningChannels(listeningChannels) {
+        return setSetting(this.db, 'listeningChannels', [...listeningChannels]);
+    }
+
+    loadAutoSync() {
+        try {
+            return getSetting(this.db, 'autoSync', { enabled: false, intervalMs: 60 * 60 * 1000 });
+        } catch {
+            return { enabled: false, intervalMs: 60 * 60 * 1000 };
+        }
+    }
+
+    saveAutoSync(enabled, intervalMs) {
+        return setSetting(this.db, 'autoSync', { enabled, intervalMs });
+    }
+
+    checkpoint() {
+        try {
+            this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+            return true;
+        } catch (err) {
+            console.error(chalk.red('❌ Checkpoint error:', err.message));
+            return false;
+        }
     }
 
     getStats() {
@@ -405,19 +567,22 @@ export class DatabaseManager {
         };
 
         try {
-            const counts = this.db.prepare(`
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(DISTINCT channel_id) as channels,
-                    COUNT(DISTINCT author_id) as authors,
-                    COUNT(CASE WHEN deleted = 1 THEN 1 END) as deleted,
-                    COUNT(CASE WHEN edited_at IS NOT NULL THEN 1 END) as edited,
-                    COUNT(CASE WHEN is_bot = 1 THEN 1 END) as bots,
-                    AVG(LENGTH(content)) as avg_length,
-                    MIN(timestamp) as oldest,
-                    MAX(timestamp) as newest
-                FROM messages
-            `).get();
+            if (!this._statsStmt) {
+                this._statsStmt = this.db.prepare(`
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(DISTINCT channel_id) as channels,
+                        COUNT(DISTINCT author_id) as authors,
+                        COUNT(CASE WHEN deleted = 1 THEN 1 END) as deleted,
+                        COUNT(CASE WHEN edited_at IS NOT NULL THEN 1 END) as edited,
+                        COUNT(CASE WHEN is_bot = 1 THEN 1 END) as bots,
+                        AVG(LENGTH(content)) as avg_length,
+                        MIN(timestamp) as oldest,
+                        MAX(timestamp) as newest
+                    FROM messages
+                `);
+            }
+            const counts = this._statsStmt.get();
 
             stats.totalMessages = counts.total;
             stats.totalChannels = counts.channels;
@@ -429,19 +594,29 @@ export class DatabaseManager {
             stats.oldestMessage = counts.oldest;
             stats.newestMessage = counts.newest;
 
-            const attachReact = this.db.prepare(`
-                SELECT
-                    SUM(json_array_length(attachments)) as attachments,
-                    SUM(json_array_length(reactions)) as reactions
-                FROM messages
-            `).get();
+            if (!this._attachReactStmt) {
+                this._attachReactStmt = this.db.prepare(`
+                    SELECT
+                        SUM(json_array_length(attachments)) as attachments,
+                        SUM(json_array_length(reactions)) as reactions
+                    FROM messages
+                `);
+            }
+            const attachReact = this._attachReactStmt.get();
 
             stats.totalAttachments = attachReact.attachments || 0;
             stats.totalReactions = attachReact.reactions || 0;
 
-            const pageCount = this.db.prepare('PRAGMA page_count').get();
-            const pageSize = this.db.prepare('PRAGMA page_size').get();
-            stats.databaseSize = (pageCount.page_count * pageSize.page_size) / (1024 * 1024);
+            if (!this._pageCountStmt) this._pageCountStmt = this.db.prepare('PRAGMA page_count');
+            if (!this._pageSizeStmt) this._pageSizeStmt = this.db.prepare('PRAGMA page_size');
+            
+            const pageCount = this._pageCountStmt.get();
+            const pageSize = this._pageSizeStmt.get();
+            let walSize = 0;
+            try {
+                walSize = statSync(this.db.name + '-wal').size;
+            } catch {}
+            stats.databaseSize = ((pageCount.page_count * pageSize.page_size) + walSize) / (1024 * 1024);
 
             return stats;
         } catch (err) {
@@ -466,11 +641,17 @@ export class DatabaseManager {
 
         if (channelId) {
             sql += ` WHERE channel_id = ?`;
-            return this.db.prepare(sql).get(channelId);
+            if (!this._channelStatsStmt) {
+                this._channelStatsStmt = this.db.prepare(sql);
+            }
+            return this._channelStatsStmt.get(channelId);
         }
 
         sql += ` GROUP BY channel_id ORDER BY message_count DESC`;
-        return this.db.prepare(sql).all();
+        if (!this._channelStatsAllStmt) {
+            this._channelStatsAllStmt = this.db.prepare(sql);
+        }
+        return this._channelStatsAllStmt.all();
     }
 
     optimize() {
@@ -488,7 +669,11 @@ export class DatabaseManager {
 
     checkIntegrity() {
         try {
-            const result = this.db.prepare('PRAGMA integrity_check').get();
+            console.log(chalk.blue('🔍 Checking database integrity...'));
+            if (!this._integrityStmt) {
+                this._integrityStmt = this.db.prepare('PRAGMA integrity_check');
+            }
+            const result = this._integrityStmt.get();
             if (result.integrity_check === 'ok') {
                 console.log(chalk.green('✅ Database integrity check passed'));
                 return true;
@@ -507,9 +692,10 @@ export class DatabaseManager {
             console.log(chalk.blue('🧹 Cleaning up database...'));
 
             const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-            const deleteResult = this.db.prepare(
-                'DELETE FROM messages WHERE deleted = 1 AND timestamp < ?'
-            ).run(thirtyDaysAgo);
+            if (!this._cleanupStmt) {
+                this._cleanupStmt = this.db.prepare('DELETE FROM messages WHERE deleted = 1 AND timestamp < ?');
+            }
+            const deleteResult = this._cleanupStmt.run(thirtyDaysAgo);
 
             console.log(chalk.green(`✅ Removed ${deleteResult.changes} old deleted messages`));
 
@@ -522,34 +708,22 @@ export class DatabaseManager {
         }
     }
 
-    getFileSize() {
-        try {
-            const pageCount = this.db.prepare('PRAGMA page_count').get();
-            const pageSize = this.db.prepare('PRAGMA page_size').get();
-            const bytes = pageCount.page_count * pageSize.page_size;
-            return {
-                bytes,
-                kb: (bytes / 1024).toFixed(2),
-                mb: (bytes / 1024 / 1024).toFixed(2),
-                gb: (bytes / 1024 / 1024 / 1024).toFixed(3)
-            };
-        } catch (err) {
-            console.error(chalk.red('❌ File size error:', err.message));
-            return null;
-        }
-    }
-
     getTableInfo() {
         try {
-            // Filter out SQLite internal tables
-            const tables = this.db.prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).all();
+            if (!this._tablesStmt) {
+                this._tablesStmt = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
+            }
+            const tables = this._tablesStmt.all();
             const info = {};
 
             for (const table of tables) {
-                const count = this.db.prepare(`SELECT COUNT(*) as count FROM ${table.name}`).get();
-                const columns = this.db.prepare(`PRAGMA table_info(${table.name})`).all();
+                // Dynamic SQL for table-specific queries - can't cache
+                const countStmt = this.db.prepare(`SELECT COUNT(*) as count FROM "${table.name}"`);
+                const count = countStmt.get();
+                
+                const columnsStmt = this.db.prepare(`PRAGMA table_info("${table.name}")`);
+                const columns = columnsStmt.all();
+                
                 info[table.name] = {
                     rowCount: count.count,
                     columns: columns.map(c => ({ name: c.name, type: c.type }))
@@ -565,8 +739,10 @@ export class DatabaseManager {
 
     getIndexInfo() {
         try {
-            const indexes = this.db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index'").all();
-            return indexes;
+            if (!this._indexesStmt) {
+                this._indexesStmt = this.db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type='index'");
+            }
+            return this._indexesStmt.all();
         } catch (err) {
             console.error(chalk.red('❌ Index info error:', err.message));
             return [];
@@ -585,70 +761,49 @@ export class DatabaseManager {
         }
     }
 
+    rebuildFts() {
+        try {
+            console.log(chalk.blue('🔍 Rebuilding FTS index...'));
+            this.db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
+            const count = this.db.prepare('SELECT COUNT(*) as n FROM messages_fts').get().n;
+            console.log(chalk.green(`✅ FTS index rebuilt (${count.toLocaleString()} rows)`));
+            return { success: true, count };
+        } catch (err) {
+            console.error(chalk.red('❌ FTS rebuild error:', err.message));
+            return { success: false, count: 0 };
+        }
+    }
+
     deduplicateMessages() {
         try {
             console.log(chalk.blue('🧹 Deduplicating messages...'));
-            
-            // Drop any leftover temp tables - use separate statements
-            try {
-                this.db.prepare('DROP TABLE IF EXISTS messages_new').run();
-            } catch { }
-            try {
-                this.db.prepare('DROP TABLE IF EXISTS messages_backup').run();
-            } catch { }
-            
-            // Get count before
-            const countBefore = this.db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
-            
-            // Backup original table
-            this.db.prepare('CREATE TABLE messages_backup AS SELECT * FROM messages').run();
-            
-            // Drop original and recreate with PRIMARY KEY and DISTINCT
-            this.db.prepare('DROP TABLE messages').run();
-            this.db.prepare(`
-                CREATE TABLE messages (
-                    id TEXT PRIMARY KEY,
-                    author_id TEXT,
-                    author_tag TEXT,
-                    content TEXT,
-                    timestamp DATETIME,
-                    channel_id TEXT,
-                    attachments TEXT,
-                    embeds TEXT,
-                    reference_message_id TEXT,
-                    reference_message_content TEXT,
-                    reactions TEXT DEFAULT '[]',
-                    is_bot INTEGER DEFAULT 0,
-                    deleted INTEGER DEFAULT 0,
-                    edited_at DATETIME
-                )
-            `).run();
-            
-            this.db.prepare('INSERT INTO messages SELECT DISTINCT * FROM messages_backup').run();
-            this.db.prepare('DROP TABLE messages_backup').run();
-            this.db.prepare('CREATE INDEX IF NOT EXISTS idx_channel_id ON messages (channel_id)').run();
-            this.db.prepare('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages (timestamp)').run();
-            
-            // Get count after
-            const countAfter = this.db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
+
+            const countBeforeStmt = this.db.prepare('SELECT COUNT(*) as count FROM messages');
+            const countBefore = countBeforeStmt.get().count;
+
+            const txn = this.db.transaction(() => {
+                this.db.exec(`
+                    DELETE FROM messages
+                    WHERE rowid NOT IN (
+                        SELECT MIN(rowid) FROM messages GROUP BY id
+                    )
+                `);
+            });
+            txn();
+
+            const countAfterStmt = this.db.prepare('SELECT COUNT(*) as count FROM messages');
+            const countAfter = countAfterStmt.get().count;
+
             const removed = countBefore - countAfter;
-            
+
             console.log(chalk.green(`✅ Deduplication complete: ${countBefore} → ${countAfter} messages (removed ${removed})`));
-            
-            // Optimize
-            this.db.prepare('VACUUM').run();
-            this.db.prepare('ANALYZE').run();
-            
-            return removed;
+
+            this.optimize();
+
+            return { removed, countBefore, countAfter };
         } catch (err) {
             console.error(chalk.red('❌ Deduplication error:', err.message));
-            // Try to restore from backup if it exists
-            try {
-                this.db.prepare('DROP TABLE IF EXISTS messages').run();
-                this.db.prepare('ALTER TABLE messages_backup RENAME TO messages').run();
-                console.log(chalk.yellow('⚠️ Restored from backup'));
-            } catch { }
-            return 0;
+            return { removed: 0, countBefore: 0, countAfter: 0 };
         }
     }
 }

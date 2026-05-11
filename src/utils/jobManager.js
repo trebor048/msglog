@@ -19,6 +19,7 @@ export class JobManager {
             status: 'running',
             color: JOB_COLORS[jobId % JOB_COLORS.length],
             logs: [],
+            recentMessages: [],
             startTime: Date.now(),
             totalMessages: 0
         };
@@ -31,7 +32,20 @@ export class JobManager {
         const job = this.activeJobs.get(jobId);
         if (!job) return;
         job.logs.push({ timestamp: Date.now(), message });
-        if (job.logs.length > 50) job.logs.shift();
+        if (job.logs.length > 200) job.logs.shift();
+    }
+
+    addMessageToJob(jobId, message) {
+        const job = this.activeJobs.get(jobId);
+        if (!job) return;
+        const content = (message.content || '').substring(0, 50);
+        job.recentMessages.push({
+            id: message.id,
+            author: message.author.tag,
+            content: content,
+            timestamp: Date.now()
+        });
+        if (job.recentMessages.length > 10) job.recentMessages.shift();
     }
 
     updateJobStatus(jobId, status, totalMessages = 0) {
@@ -42,8 +56,14 @@ export class JobManager {
         if (status !== 'running') {
             job.endTime = Date.now();
             job.duration = job.endTime - job.startTime;
-            setTimeout(() => this.activeJobs.delete(jobId), 5 * 60 * 1000);
+            setTimeout(() => this.activeJobs.delete(jobId), 10 * 60 * 1000); // keep for 10 min
         }
+    }
+
+    setJobError(jobId, errorMessage) {
+        const job = this.activeJobs.get(jobId);
+        if (!job) return;
+        job.error = errorMessage;
     }
 
     channelHasActiveJob(channelId) {

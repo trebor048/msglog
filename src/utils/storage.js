@@ -6,26 +6,28 @@ import path from 'path';
 import { getFileExtension } from './utils.js';
 
 // ============ MESSAGE STORAGE ============
+const MAX_SQLITE_PARAMS = 900;
+
 export class MessageStore {
-    constructor(db, config) {
+    constructor(db, config, performance = null) {
         this.db = db;
         this.config = config;
+        this.performance = performance;
         this.referenceCache = new Map();
         this.failedReferences = new Set();
         this.insertStmt = null;
         this.updateReactionsStmt = null;
         this.deleteStmt = null;
         this.updateContentStmt = null;
-        this.batchSize = 100;
-        this.metrics = {
-            messagesStored: 0,
-            attachmentsProcessed: 0,
-            errors: 0
-        };
+
     }
 
     _getInsertStatement() {
         if (!this.insertStmt && this.db) {
+            // INSERT OR REPLACE so the after-insert trigger always fires for FTS.
+            // OR REPLACE on a duplicate id = delete old row + insert new row,
+            // which is fine because message content doesn't change (edits go through updateMessageContent).
+            // We guard against unnecessary re-inserts by deduping in the sync engine first.
             this.insertStmt = this.db.prepare(`
                 INSERT OR IGNORE INTO messages
                 (id, author_id, author_tag, content, timestamp, channel_id,
@@ -84,7 +86,7 @@ export class MessageStore {
         for (const a of message.attachments.values()) {
             try {
                 const localPath = await downloadAttachmentFn(a.url, message.channel.id, a.name, message.id, a.size);
-                this.metrics.attachmentsProcessed++;
+                if (this.performance) this.performance.stats.totalAttachmentsDownloaded++;
                 results.push(localPath
                     ? { originalUrl: a.url, localPath, filename: a.name, size: a.size }
                     : { url: a.url, filename: a.name, size: a.size }
@@ -105,13 +107,15 @@ export class MessageStore {
         if (!insert) return;
 
         try {
-            const rows = await Promise.all(messages.map(async msg => {
-                const [refContent, attachmentData, processedEmbeds] = await Promise.all([
-                    this.fetchReferenceContent(msg, channel, withRetry),
-                    this.buildAttachmentData(msg, downloadAttachmentFn),
-                    processEmbedsFn ? processEmbedsFn(msg.embeds, msg.channel.id, msg.id) : msg.embeds
-                ]);
-                return {
+            const rows = [];
+            for (const msg of messages) {
+                const refContent = await this.fetchReferenceContent(msg, channel, withRetry);
+                const attachmentData = await this.buildAttachmentData(msg, downloadAttachmentFn);
+                const processedEmbeds = processEmbedsFn
+                    ? await processEmbedsFn(msg.embeds, msg.channel.id, msg.id)
+                    : msg.embeds;
+
+                rows.push({
                     id: msg.id,
                     author_id: msg.author.id,
                     author_tag: msg.author.tag,
@@ -124,14 +128,24 @@ export class MessageStore {
                     reference_message_content: refContent,
                     reactions: JSON.stringify([]),
                     is_bot: msg.author.bot ? 1 : 0
-                };
-            }));
+                });
+            }
 
             const txn = this.db.transaction(rows => { for (const row of rows) insert.run(row); });
             txn(rows);
-            this.metrics.messagesStored += rows.length;
+            if (this.performance) {
+                this.performance.stats.totalMessagesStored += rows.length;
+                this.performance.stats.lastSync = {
+                    channelId: channel.id,
+                    messageCount: rows.length,
+                    timestamp: new Date().toISOString()
+                };
+            }
         } catch (err) {
-            this.metrics.errors++;
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             console.error(chalk.red('❌ DB batch insert error:', err.message));
         }
     }
@@ -146,7 +160,10 @@ export class MessageStore {
                 messageId
             );
         } catch (err) {
-            this.metrics.errors++;
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             console.error(chalk.red('❌ DB reaction update error:', err.message));
         }
     }
@@ -157,7 +174,10 @@ export class MessageStore {
             const stmt = this._getDeleteStatement();
             stmt.run(messageId);
         } catch (err) {
-            this.metrics.errors++;
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             console.error(chalk.red('❌ DB delete-mark error:', err.message));
         }
     }
@@ -168,7 +188,10 @@ export class MessageStore {
             const stmt = this._getUpdateContentStatement();
             stmt.run(newContent, editedAt?.toISOString() ?? null, messageId);
         } catch (err) {
-            this.metrics.errors++;
+            if (this.performance) {
+                this.performance.stats.totalErrors++;
+                this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+            }
             console.error(chalk.red('❌ DB edit update error:', err.message));
         }
     }
@@ -180,19 +203,27 @@ export class MessageStore {
         if (this.failedReferences.size > this.config.maxFailedReferences) this.failedReferences.clear();
     }
 
-    getMetrics() {
-        return { ...this.metrics };
-    }
+    _getMostRecentStmt = null;
+    _getOldestStmt = null;
+    _getCountStmt = null;
 
-    resetMetrics() {
-        this.metrics = { messagesStored: 0, attachmentsProcessed: 0, errors: 0 };
+    checkpoint() {
+        try {
+            if (this.db) this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+            return true;
+        } catch (err) {
+            console.error(chalk.red('❌ WAL checkpoint error:', err.message));
+            return false;
+        }
     }
 
     getMostRecentMessage(channelId) {
         if (!this.db) return null;
         try {
-            const stmt = this.db.prepare('SELECT id, timestamp FROM messages WHERE channel_id = ? ORDER BY timestamp DESC LIMIT 1');
-            return stmt.get(channelId);
+            if (!this._getMostRecentStmt) {
+                this._getMostRecentStmt = this.db.prepare('SELECT id, timestamp FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT 1');
+            }
+            return this._getMostRecentStmt.get(channelId);
         } catch (err) {
             console.error(chalk.red('❌ Error fetching most recent message:', err.message));
             return null;
@@ -202,8 +233,10 @@ export class MessageStore {
     getOldestMessage(channelId) {
         if (!this.db) return null;
         try {
-            const stmt = this.db.prepare('SELECT id, timestamp FROM messages WHERE channel_id = ? ORDER BY timestamp ASC LIMIT 1');
-            return stmt.get(channelId);
+            if (!this._getOldestStmt) {
+                this._getOldestStmt = this.db.prepare('SELECT id, timestamp FROM messages WHERE channel_id = ? ORDER BY id ASC LIMIT 1');
+            }
+            return this._getOldestStmt.get(channelId);
         } catch (err) {
             console.error(chalk.red('❌ Error fetching oldest message:', err.message));
             return null;
@@ -213,8 +246,10 @@ export class MessageStore {
     getMessageCount(channelId) {
         if (!this.db) return 0;
         try {
-            const stmt = this.db.prepare('SELECT COUNT(*) as count FROM messages WHERE channel_id = ?');
-            return stmt.get(channelId)?.count || 0;
+            if (!this._getCountStmt) {
+                this._getCountStmt = this.db.prepare('SELECT COUNT(*) as count FROM messages WHERE channel_id = ?');
+            }
+            return this._getCountStmt.get(channelId)?.count || 0;
         } catch (err) {
             console.error(chalk.red('❌ Error counting messages:', err.message));
             return 0;
@@ -224,10 +259,24 @@ export class MessageStore {
     getExistingMessageIds(channelId, messageIds) {
         if (!this.db || !messageIds.length) return new Set();
         try {
-            const placeholders = messageIds.map(() => '?').join(',');
-            const stmt = this.db.prepare(`SELECT id FROM messages WHERE channel_id = ? AND id IN (${placeholders})`);
-            const results = stmt.all(channelId, ...messageIds);
-            return new Set(results.map(r => r.id));
+            const existingIds = new Set();
+            // Chunk to stay under SQLite's variable limit.
+            // Cache one prepared statement per chunk size to avoid re-preparing on every call.
+            for (let i = 0; i < messageIds.length; i += MAX_SQLITE_PARAMS) {
+                const chunk = messageIds.slice(i, i + MAX_SQLITE_PARAMS);
+                const cacheKey = `existingIds_${chunk.length}`;
+                if (!this._existingStmtCache) this._existingStmtCache = new Map();
+                if (!this._existingStmtCache.has(cacheKey)) {
+                    const placeholders = chunk.map(() => '?').join(',');
+                    this._existingStmtCache.set(
+                        cacheKey,
+                        this.db.prepare(`SELECT id FROM messages WHERE channel_id = ? AND id IN (${placeholders})`)
+                    );
+                }
+                const rows = this._existingStmtCache.get(cacheKey).all(channelId, ...chunk);
+                rows.forEach(r => existingIds.add(r.id));
+            }
+            return existingIds;
         } catch (err) {
             console.error(chalk.red('❌ Error checking existing messages:', err.message));
             return new Set();
@@ -293,13 +342,40 @@ export async function downloadAttachment(url, channelId, filename, withRetry, co
         response.data.pipe(writer);
 
         return new Promise((resolve, reject) => {
+            let settled = false;
+            let downloadedBytes = 0;
+
+            const cleanup = (err) => {
+                if (settled) return;
+                settled = true;
+                response.data.destroy();
+                writer.destroy();
+                fs.unlink(filePath).catch(() => {});
+                reject(err);
+            };
+
+            response.data.on('data', chunk => {
+                downloadedBytes += chunk.length;
+                if (downloadedBytes > MAX_FILE_SIZE) {
+                    cleanup(new Error(`Download exceeded max size: ${filename}`));
+                }
+            });
+
+            response.data.on('error', (err) => {
+                console.log(chalk.yellow(`⚠️ Download stream error for ${filename}: ${err.message}`));
+                cleanup(err);
+            });
+
             writer.on('finish', () => {
+                if (settled) return;
+                settled = true;
                 if (size > 5 * 1024 * 1024) console.log(chalk.green(`✅ Downloaded ${filename}`));
                 resolve(filePath);
             });
+
             writer.on('error', (err) => {
                 console.log(chalk.yellow(`⚠️ Failed to write file ${filename}: ${err.message}`));
-                reject(err);
+                cleanup(err);
             });
         });
     } catch (err) {
@@ -312,8 +388,9 @@ export async function processEmbeds(embeds, channelId, downloadAttachmentFn, con
     if (!config.downloadAttachments || !embeds?.length) return embeds;
 
     const seenUrls = new Set();
+    const results = [];
 
-    return Promise.all(embeds.map(async embed => {
+    for (const embed of embeds) {
         const out = { ...embed };
         for (const [key, prefix] of [['image', 'embed_image'], ['thumbnail', 'embed_thumb'], ['video', 'embed_video']]) {
             const url = embed[key]?.url;
@@ -323,6 +400,8 @@ export async function processEmbeds(embeds, channelId, downloadAttachmentFn, con
             const localPath = await downloadAttachmentFn(url, channelId, filename, messageId);
             if (localPath) out[key] = { ...embed[key], originalUrl: url, localPath };
         }
-        return out;
-    }));
+        results.push(out);
+    }
+
+    return results;
 }
