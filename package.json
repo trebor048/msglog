@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "node main.js",
-    "lint": "eslint main.js"
+    "lint": "eslint .",
+    "test": "node --test",
+    "doctor": "node scripts/doctor.js",
+    "verify": "npm run lint && npm test && npm run doctor"
   },
   "keywords": [
     "discord",
@@ -19,10 +22,9 @@
   "author": "luckycanucky",
   "license": "MIT",
   "dependencies": {
-    "axios": "^1.6.8",
+    "axios": "^1.15.2",
     "better-sqlite3": "^12.8.0",
     "blessed": "^0.1.81",
-    "blessed-contrib": "^4.11.0",
     "chalk": "^5.3.0",
     "discord.js-selfbot-v13": "^3.5.1",
     "dotenv": "^16.4.5",
@@ -30,5 +32,14 @@
   },
   "engines": {
     "node": ">=16.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1"
+  },
+  "overrides": {
+    "follow-redirects": "^1.15.12",
+    "lodash": "^4.17.24",
+    "undici": "^6.24.0",
+    "ws": "^8.20.1"
   }
 }

@@ -101,8 +101,12 @@ export class SyncEngine {
         isShuttingDown = false,
         isPausedFn  = null
     ) {
+        const isShutdownRequested = typeof isShuttingDown === 'function'
+            ? isShuttingDown
+            : () => Boolean(isShuttingDown);
         const attempts  = this.config.retryAttempts   ?? 3;
         const baseDelay = this.config.retryBaseDelayMs ?? 800;
+        const maxPages = Math.max(1, Number(this.config.maxSyncPages ?? 100_000));
         const db        = this.messageStore.db;
 
         // All Discord message fetches bypass the circuit breaker
@@ -179,25 +183,38 @@ export class SyncEngine {
             log(`🚀 ${direction} sync started for #${channel.name}`);
 
             // ── Main fetch loop ──────────────────────────────────────────────
-            const MAX_PAGES = 100_000;
             let pageCount = 0;
+            let stoppedByPageLimit = false;
 
             while (true) {
-                if (++pageCount > MAX_PAGES) {
-                    log(`⚠️ Reached page limit (${MAX_PAGES}) — stopping`);
+                if (++pageCount > maxPages) {
+                    log(`⚠️ Reached page limit (${maxPages}) — stopping`);
+                    stoppedByPageLimit = true;
                     break;
+                }
+                if (this.jobManager.isCancelRequested(jobId)) {
+                    log('🛑 Cancellation requested — stopping job');
+                    this.jobManager.setJobError(jobId, 'Cancelled by user');
+                    this.jobManager.updateJobStatus(jobId, 'error', totalMessages);
+                    return;
                 }
 
                 // Shutdown / pause
-                if (isShuttingDown) {
+                if (isShutdownRequested()) {
                     log('🛑 Shutdown signal — halting job');
                     this.jobManager.updateJobStatus(jobId, 'error', totalMessages);
                     return;
                 }
                 if (isPausedFn?.()) {
                     log('⏸️ Paused — waiting...');
-                    while (isPausedFn?.() && !isShuttingDown) await sleep(2000);
-                    if (isShuttingDown) { this.jobManager.updateJobStatus(jobId, 'error', totalMessages); return; }
+                    while (isPausedFn?.() && !isShutdownRequested() && !this.jobManager.isCancelRequested(jobId)) await sleep(2000);
+                    if (this.jobManager.isCancelRequested(jobId)) {
+                        log('🛑 Cancellation requested — stopping job');
+                        this.jobManager.setJobError(jobId, 'Cancelled by user');
+                        this.jobManager.updateJobStatus(jobId, 'error', totalMessages);
+                        return;
+                    }
+                    if (isShutdownRequested()) { this.jobManager.updateJobStatus(jobId, 'error', totalMessages); return; }
                     log('▶️ Resumed');
                 }
 
@@ -271,7 +288,7 @@ export class SyncEngine {
                 const toStore = direction === 'forward' ? [...newMsgs].reverse() : newMsgs;
                 await this.messageStore.storeMessagesBatch(
                     toStore, channel, withRetry,
-                    this.downloadAttachmentFn, this.processEmbedsFn, isShuttingDown
+                    this.downloadAttachmentFn, this.processEmbedsFn, isShutdownRequested
                 );
 
                 // Update job preview
@@ -313,6 +330,14 @@ export class SyncEngine {
                 });
             }
 
+            if (stoppedByPageLimit) {
+                const reason = `Stopped at safety page limit (${maxPages}); channel not marked fully synced`;
+                log(`⚠️ ${reason}`);
+                this.jobManager.setJobError(jobId, reason);
+                this.jobManager.updateJobStatus(jobId, 'error', totalMessages);
+                return;
+            }
+
             // ── Completion ───────────────────────────────────────────────────
             log(`✅ Done — ${totalMessages.toLocaleString()} new messages from #${channel.name}`);
             this.jobManager.updateJobStatus(jobId, 'completed', totalMessages);
@@ -342,21 +367,30 @@ export class SyncEngine {
     }
 
     async syncAllChannelsParallel(client, listeningChannels, withRetry, isShuttingDown, isPausedFn = null) {
+        const isShutdownRequested = typeof isShuttingDown === 'function'
+            ? isShuttingDown
+            : () => Boolean(isShuttingDown);
+        if (isShutdownRequested()) return;
+
         const channels = [...listeningChannels]
             .map(id => client.channels.cache.get(id))
             .filter(Boolean);
 
         if (!channels.length) return;
 
+        const runningJobs = this.jobManager.getAllJobs().filter(j => j.status === 'running').length;
+        const capacity = Math.max(0, this.config.maxConcurrentJobs - runningJobs);
+        if (capacity === 0) return;
+
         const available = channels
             .filter(ch => !this.jobManager.channelHasActiveJob(ch.id))
-            .slice(0, this.config.maxConcurrentJobs);
+            .slice(0, capacity);
 
         if (!available.length) return;
 
         available.forEach(ch => {
             const job = this.jobManager.createJob(ch, 'resume', null, null);
-            this.syncChannelMessages(ch, 'resume', null, null, job.id, withRetry, isShuttingDown, isPausedFn)
+            this.syncChannelMessages(ch, 'resume', null, null, job.id, withRetry, isShutdownRequested, isPausedFn)
                 .catch(err => {
                     this.jobManager.logToJob(job.id, `❌ Unhandled: ${err.message}`);
                     this.jobManager.updateJobStatus(job.id, 'error');

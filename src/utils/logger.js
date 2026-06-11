@@ -8,6 +8,7 @@ export class Logger {
         this.logDir = 'logs';
         this.currentDate = new Date().toISOString().split('T')[0];
         this.logFile = path.join(this.logDir, `${this.currentDate}.log`);
+        this._appendFailed = false;
         try {
             mkdirSync(this.logDir, { recursive: true });
         } catch (err) {
@@ -25,7 +26,14 @@ export class Logger {
 
         const timestamp = now.toISOString();
         const logLine = `[${timestamp}] [${level}] ${message}${data ? ' ' + JSON.stringify(data) : ''}\n`;
-        fs.appendFile(this.logFile, logLine).catch(() => {});
+        fs.appendFile(this.logFile, logLine)
+            .then(() => { this._appendFailed = false; })
+            .catch((err) => {
+                if (!this._appendFailed) {
+                    this._appendFailed = true;
+                    process.stderr.write(`[logger] failed to append log file: ${err.message}\n`);
+                }
+            });
 
         const colorMap = {
             'INFO': chalk.blue,

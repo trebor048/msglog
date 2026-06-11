@@ -1,4 +1,5 @@
 import blessed from 'blessed';
+import { Validator } from '../../utils/utils.js';
 
 /**
  * Search Messages Screen
@@ -82,7 +83,7 @@ export class SearchScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' UP/DOWN Navigate  ENTER Select  TAB Switch Panel  ? Help  Q Back'
+            content: ' UP/DOWN Navigate  ENTER Select  TAB Switch Panel  ? Help  ESC/Q Back'
         });
 
         this.widgets.menu.focus();
@@ -103,7 +104,7 @@ export class SearchScreen {
     handleMenuSelect(index) {
         switch (index) {
             case 0: this.promptAndSearch('Enter keyword:', (q) => this.searchInstance.search({ query: q, limit: 50 })); break;
-            case 1: this.promptAndSearch('Enter author name or ID:', (a) => this.searchInstance.search({ authorId: a, limit: 50 })); break;
+            case 1: this.promptAndSearch('Enter author name or ID:', (a) => this.searchInstance.search({ authorQuery: a, limit: 50 })); break;
             case 2: this.promptDateRange(); break;
             case 3: this.showResults(this.searchInstance.search({ hasAttachments: true, limit: 50 }), 'Attachments Only'); break;
             case 4: this.showResults(this.searchInstance.search({ hasReactions: true, limit: 50 }), 'Reactions Only'); break;
@@ -124,18 +125,23 @@ export class SearchScreen {
             border: { type: 'line' },
             style: { border: { fg: 'yellow' }, bg: 'black', fg: 'white' },
             label: ` ${label} `,
-            inputOnFocus: true
+            inputOnFocus: true,
+            keys: true,
+            mouse: true
         });
 
-        input.focus();
         this.screen.render();
 
-        input.on('submit', (value) => {
+        input.focus();
+
+        input.key('enter', () => {
+            const value = input.getValue();
             input.destroy();
+            this.screen.render();
             if (value && value.trim()) {
                 const results = searchFn(value.trim());
                 this.showResults(results, `"${value.trim()}"`);
-                this.widgets.results.focus(); // Focus results after search
+                this.widgets.results.focus();
             } else {
                 this.widgets.results.setContent('\n{yellow-fg}No search term entered{/yellow-fg}');
                 this.widgets.menu.focus();
@@ -143,65 +149,103 @@ export class SearchScreen {
             }
         });
 
-        input.on('cancel', () => {
+        input.key('escape', () => {
             input.destroy();
+            this.screen.render();
             this.widgets.menu.focus();
             this.screen.render();
         });
     }
 
     promptDateRange() {
+        this.promptInput('Start date (YYYY-MM-DD):', (startDate) => {
+            if (!startDate) {
+                this.widgets.menu.focus();
+                this.screen.render();
+                return;
+            }
+
+            this.promptInput('End date (YYYY-MM-DD):', (endDate) => {
+                if (!endDate) {
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
+                if (!Validator.isValidDate(startDate) || !Validator.isValidDate(endDate)) {
+                    this.widgets.results.setContent('\n{red-fg}Invalid date format. Use YYYY-MM-DD{/red-fg}');
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
+                if (!Validator.isValidDateRange(startDate, endDate)) {
+                    this.widgets.results.setContent('\n{red-fg}Start date must be before end date{/red-fg}');
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
+                const results = this.searchInstance.search({ startDate, endDate, limit: 50 });
+                this.showResults(results, `${startDate} to ${endDate}`);
+                this.widgets.results.focus();
+            });
+        });
+    }
+
+    promptInput(label, callback) {
         const input = blessed.textbox({
             parent: this.widgets.main,
             top: 'center', left: 'center',
             width: '60%', height: 3,
             border: { type: 'line' },
             style: { border: { fg: 'yellow' }, bg: 'black', fg: 'white' },
-            label: ' Start date (YYYY-MM-DD): ',
-            inputOnFocus: true
+            label: ` ${label} `,
+            inputOnFocus: true,
+            keys: true,
+            mouse: true
         });
 
-        input.focus();
         this.screen.render();
+        input.focus();
 
-        input.on('submit', (startDate) => {
+        input.key('enter', () => {
+            const value = input.getValue()?.trim();
             input.destroy();
-            if (!startDate || !startDate.trim()) {
-                this.widgets.menu.focus();
-                this.screen.render();
-                return;
-            }
-            const results = this.searchInstance.search({ startDate: startDate.trim(), limit: 50 });
-            this.showResults(results, `From ${startDate.trim()}`);
-            this.widgets.results.focus(); // Focus results after search
+            this.screen.render();
+            callback(value || null);
         });
 
-        input.on('cancel', () => {
+        input.key('escape', () => {
             input.destroy();
-            this.widgets.menu.focus();
             this.screen.render();
+            callback(null);
         });
     }
 
     showResults(results, title) {
+        const safeTitle = Validator.sanitizeBlessedTags(String(title || 'Results'));
         if (!results || !results.length) {
             this.widgets.results.setContent(
-                `\n{yellow-fg}${title}{/yellow-fg}\n\n{red-fg}No results found{/red-fg}`
+                `\n{yellow-fg}${safeTitle}{/yellow-fg}\n\n{red-fg}No results found{/red-fg}`
             );
             this.widgets.menu.focus();
             this.screen.render();
             return;
         }
 
-        let content = `\n{cyan-fg}{bold}${title}{/bold}{/cyan-fg} {gray-fg}(${results.length} results){/gray-fg}\n`;
+        let content = `\n{cyan-fg}{bold}${safeTitle}{/bold}{/cyan-fg} {gray-fg}(${results.length} results){/gray-fg}\n`;
         content += '{gray-fg}' + '─'.repeat(60) + '{/gray-fg}\n';
 
         results.slice(0, 50).forEach(msg => {
-            const author = msg.author_tag || 'Unknown';
+            const author = Validator.sanitizeBlessedTags(String(msg.author_tag || 'Unknown'));
             const time = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : '';
-            const text = (msg.content || '').substring(0, 100);
-            const suffix = (msg.content || '').length > 100 ? '...' : '';
-            const channel = msg.channel_name ? ` {gray-fg}in #${msg.channel_name}{/gray-fg}` : '';
+            const rawText = String(msg.content || '');
+            const text = Validator.sanitizeBlessedTags(rawText.substring(0, 100));
+            const suffix = rawText.length > 100 ? '...' : '';
+            const channel = msg.channel_id
+                ? Validator.sanitizeBlessedTags(` [${msg.channel_id}]`)
+                : '';
 
             content += `\n{green-fg}${author}{/green-fg}${channel} {gray-fg}${time}{/gray-fg}\n`;
             content += `  ${text}${suffix}\n`;
@@ -229,24 +273,25 @@ export class SearchScreen {
             if (topAuthors && topAuthors.length) {
                 content += '\n{cyan-fg}{bold}Top 5 Authors{/bold}{/cyan-fg}\n';
                 topAuthors.forEach((a, i) => {
-                    content += `  ${i + 1}. {green-fg}${a.author_tag}{/green-fg} {gray-fg}(${a.message_count} msgs){/gray-fg}\n`;
+                    content += `  ${i + 1}. {green-fg}${Validator.sanitizeBlessedTags(a.author_tag)}{/green-fg} {gray-fg}(${a.message_count} msgs){/gray-fg}\n`;
                 });
             }
 
             this.widgets.results.setContent(content);
             this.widgets.results.setScrollPerc(0);
-            this.widgets.results.focus(); // Focus results to allow scrolling
+            this.widgets.results.focus();
             this.screen.render();
         } catch (err) {
-            this.widgets.results.setContent(`\n{red-fg}Stats error: ${err.message}{/red-fg}`);
+            const safeMsg = Validator.sanitizeErrorMessage(err);
+            this.widgets.results.setContent(`\n{red-fg}Stats error: ${safeMsg}{/red-fg}`);
             this.widgets.menu.focus();
             this.screen.render();
         }
     }
 
     setupKeyBindings() {
-        this.widgets.menu.key(['q', 'escape'], () => this.onBack());
-        this.widgets.results.key(['q', 'escape'], () => this.onBack());
+        this.widgets.menu.key(['escape', 'q'], () => this.onBack());
+        this.widgets.results.key(['escape', 'q'], () => this.onBack());
     }
 
     destroy() {

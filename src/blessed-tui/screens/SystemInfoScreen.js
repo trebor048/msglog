@@ -1,5 +1,5 @@
 import blessed from 'blessed';
-import { formatDuration } from '../../utils/utils.js';
+import { formatDuration, Validator } from '../../utils/utils.js';
 
 /**
  * System Info Screen
@@ -11,9 +11,11 @@ export class SystemInfoScreen {
         this.ctx = ctx;
         this.onBack = onBack;
         this.widgets = {};
+        this.updateInterval = null;
 
         this.create();
         this.setupKeyBindings();
+        this.startUpdates();
     }
 
     create() {
@@ -51,15 +53,15 @@ export class SystemInfoScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' ENTER/Q Back'
+            content: ' ESC/Q/ENTER Back'
         });
 
-        this.updateDisplay();
         this.widgets.content.focus();
     }
 
     updateDisplay() {
         const stats = this.ctx.performance.getStats();
+        const runtime = this.ctx.runtimeMetrics || {};
 
         let c = '\n{cyan-fg}{bold}Session Statistics{/bold}{/cyan-fg}\n';
         c += '{gray-fg}' + '─'.repeat(50) + '{/gray-fg}\n\n';
@@ -70,6 +72,8 @@ export class SystemInfoScreen {
         c += `  Sync Operations:   {green-fg}${stats.totalSyncs.toLocaleString()}{/green-fg}\n`;
         c += `  Search Queries:    {green-fg}${stats.totalSearches.toLocaleString()}{/green-fg}\n`;
         c += `  Runtime Errors:    {red-fg}${stats.totalErrors.toLocaleString()}{/red-fg}\n`;
+        c += `  Queue Processed:   {green-fg}${(runtime.queuedMessagesProcessed ?? 0).toLocaleString()}{/green-fg}\n`;
+        c += `  Queue Dropped:     {red-fg}${(runtime.queuedMessagesDropped ?? 0).toLocaleString()}{/red-fg}\n`;
 
         c += `\n{cyan-fg}{bold}System Uptime{/bold}{/cyan-fg}\n`;
         c += `  {white-fg}${formatDuration(stats.uptime)}{/white-fg}\n`;
@@ -82,8 +86,9 @@ export class SystemInfoScreen {
         }
 
         if (stats.lastError) {
+            const safeMsg = Validator.sanitizeErrorMessage(stats.lastError);
             c += `\n{red-fg}{bold}Last Error{/bold}{/red-fg}\n`;
-            c += `  {red-fg}${stats.lastError.message}{/red-fg}\n`;
+            c += `  {red-fg}${safeMsg}{/red-fg}\n`;
             c += `  {gray-fg}${stats.lastError.timestamp}{/gray-fg}\n`;
         }
 
@@ -92,10 +97,16 @@ export class SystemInfoScreen {
     }
 
     setupKeyBindings() {
-        this.widgets.content.key(['enter', 'q', 'escape'], () => this.onBack());
+        this.widgets.content.key(['escape', 'q', 'enter'], () => this.onBack());
+    }
+
+    startUpdates() {
+        this.updateDisplay();
+        this.updateInterval = setInterval(() => this.updateDisplay(), 1000);
     }
 
     destroy() {
+        if (this.updateInterval) clearInterval(this.updateInterval);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

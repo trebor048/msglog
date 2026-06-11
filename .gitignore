@@ -1,23 +1,72 @@
-# Environment and Secrets
+# Environment and secrets
 .env
+.env.*
+!.env.example
 config.json
-*.md
+
+# Local agent instructions
+AGENTS.md
+GEMINI.md
+
+# Generated investigation and implementation reports
+BLESSED_TUI_*.md
+BUGFIX_SUMMARY.md
+COLOR_TAGS_FIX.md
+COMPLETION_REPORT.md
+CRITICAL_ISSUES_SUMMARY.md
+DISCORD_API_INVESTIGATION.md
+DOCUMENTATION_INDEX.md
+ERROR_ANALYSIS_INDEX.md
+FETCH_*.md
+FINAL_*.md
+IMPLEMENTATION_*.md
+INTEGRATION_CHECKLIST.md
+MESSAGE_PREVIEW_FEATURE.md
+PROJECT_STATUS_REPORT.md
+QUICK_START_GUIDE.md
+SPINNER_AND_UI_FIXES.md
+START_HERE.md
+TRIPLE_CHECK_ANALYSIS.md
+TUI_*.md
+UI_REDESIGN_COMPLETE.md
+README_BLESSED_TUI.md
+
 # Databases and SQLite artifacts
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
 
-# Dependency Directories
+# Dependency and generated directories
 node_modules/
 dist/
 build/
+content/
+exports/
+backups/
 
-# Logs and Debugging
+# Logs and debugging
 logs/
 *.log
 npm-debug.log*
+tui-console-*.log
 
-# OS specific files
+# Temporary and coverage artifacts
+test/
+coverage/
+.nyc_output/
+test-results/
+*.tmp
+*.temp
+*.cache
+*.swp
+
+# Editor and OS files
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Local tools
+.qwen/

@@ -1,4 +1,5 @@
 import blessed from 'blessed';
+import { Validator } from '../../utils/utils.js';
 
 /**
  * Live Job Monitor Screen
@@ -43,10 +44,11 @@ export class LiveMonitor {
             content: ' LIVE JOB MONITOR'
         });
 
-        // Summary bar — plain text
+        // Summary bar
         this.widgets.summary = blessed.box({
             parent: this.widgets.main,
             top: 1, left: 0, width: '100%', height: 1,
+            tags: true,
             style: { bg: 'black', fg: 'cyan' }
         });
 
@@ -112,7 +114,7 @@ export class LiveMonitor {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' UP/DOWN Select/Scroll  TAB Switch Panel  Q/ENTER Back  PAGEUP/PAGEDOWN Scroll Fast'
+            content: ' UP/DOWN Select/Scroll  TAB Switch Panel  C Cancel Job  ESC/Q Back  ENTER Select Job  PAGEUP/PAGEDOWN Scroll Fast'
         });
 
         this.widgets.jobList.focus();
@@ -162,7 +164,7 @@ export class LiveMonitor {
                 ? this.formatElapsed(j.endTime - j.startTime)
                 : this.formatElapsed(Date.now() - j.startTime);
             const msgs = j.totalMessages.toLocaleString();
-            return ` [${icon}] #${j.id} ${j.channel}  ${msgs} msgs  ${elapsed}`;
+            return ` [${icon}] #${j.id} ${Validator.sanitizeBlessedTags(j.channel)}  ${msgs} msgs  ${elapsed}`;
         });
 
         if (!items.length) items.push(' No jobs yet');
@@ -189,13 +191,13 @@ export class LiveMonitor {
         const statusColor = job.status === 'running'   ? 'cyan'  :
                             job.status === 'completed' ? 'green' : 'red';
 
-        this.widgets.logBox.setLabel(` Job #${job.id} — ${job.channel} `);
+        this.widgets.logBox.setLabel(` Job #${job.id} — ${Validator.sanitizeBlessedTags(job.channel)} `);
 
         let content = '';
 
         // Job header info
         content += `{${statusColor}-fg}{bold}Status: ${job.status.toUpperCase()}{/bold}{/${statusColor}-fg}\n`;
-        content += `{white-fg}Channel:   ${job.channel} (${job.channelId}){/white-fg}\n`;
+        content += `{white-fg}Channel:   ${Validator.sanitizeBlessedTags(job.channel)} (${job.channelId}){/white-fg}\n`;
         content += `{white-fg}Direction: ${job.direction}{/white-fg}\n`;
         content += `{white-fg}Messages:  ${job.totalMessages.toLocaleString()}{/white-fg}\n`;
 
@@ -223,7 +225,7 @@ export class LiveMonitor {
         } else {
             job.logs.forEach(entry => {
                 const time = new Date(entry.timestamp).toLocaleTimeString();
-                const msg = String(entry.message);
+                const msg = Validator.sanitizeBlessedTags(String(entry.message));
 
                 // Color-code log lines by content
                 let lineColor = 'white';
@@ -249,8 +251,8 @@ export class LiveMonitor {
             content += '{cyan-fg}{bold}RECENT MESSAGES{/bold}{/cyan-fg}\n';
             content += '{cyan-fg}' + '─'.repeat(50) + '{/cyan-fg}\n\n';
             job.recentMessages.slice(-5).forEach(m => {
-                const author = String(m.author || '').substring(0, 20);
-                const text = String(m.content || '').substring(0, 60);
+                const author = Validator.sanitizeBlessedTags(String(m.author || '').substring(0, 20));
+                const text = Validator.sanitizeBlessedTags(String(m.content || '').substring(0, 60));
                 content += `{green-fg}${author}{/green-fg}: {white-fg}${text}{/white-fg}\n`;
             });
         }
@@ -263,47 +265,71 @@ export class LiveMonitor {
     }
 
     updateDisplay() {
-        const allJobs = this.ctx.jobManager.getAllJobs();
-        const running  = allJobs.filter(j => j.status === 'running').length;
-        const completed = allJobs.filter(j => j.status === 'completed').length;
-        const failed   = allJobs.filter(j => j.status === 'error').length;
-        const isPaused = this.ctx.isPaused;
+        try {
+            const allJobs = this.ctx.jobManager.getAllJobs();
+            const running  = allJobs.filter(j => j.status === 'running').length;
+            const completed = allJobs.filter(j => j.status === 'completed').length;
+            const failed   = allJobs.filter(j => j.status === 'error').length;
+            const isPaused = this.ctx.isPaused;
 
-        // Check for newly completed jobs
-        allJobs.forEach(job => {
-            if (job.status !== 'running' && !this.notifiedJobs.has(job.id)) {
-                this.notifiedJobs.add(job.id);
-                const color = job.status === 'completed' ? 'green' : 'red';
-                const statusStr = job.status === 'completed' ? 'COMPLETED' : 'FAILED';
-                this.widgets.message.display(
-                    `{${color}-fg}{bold}Job #${job.id} ${statusStr}{/bold}{/${color}-fg}\n\n` +
-                    `Channel: #${job.channel}\n` +
-                    `Messages: ${job.totalMessages.toLocaleString()}\n` +
-                    `Time: ${this.formatElapsed(job.duration || 0)}`,
-                    3
-                );
+            // Prune notifiedJobs to prevent unbounded growth (keep last 500)
+            if (this.notifiedJobs.size > 500) {
+                const entries = [...this.notifiedJobs];
+                this.notifiedJobs = new Set(entries.slice(entries.length - 500));
             }
-        });
 
-        const statusLabel = isPaused ? '{yellow-fg}PAUSED{/yellow-fg}' : '{green-fg}ACTIVE{/green-fg}';
-        this.widgets.summary.setContent(
-            ` Status: ${statusLabel}   Running: ${running}   Completed: ${completed}   Failed: ${failed}` +
-            (failed > 0 ? '   [!] Check failed jobs for errors' : '')
-        );
+            // Check for newly completed jobs
+            allJobs.forEach(job => {
+                if (job.status !== 'running' && !this.notifiedJobs.has(job.id)) {
+                    this.notifiedJobs.add(job.id);
+                    const color = job.status === 'completed' ? 'green' : 'red';
+                    const statusStr = job.status === 'completed' ? 'COMPLETED' : 'FAILED';
+                    this.widgets.message.display(
+                        `{${color}-fg}{bold}Job #${job.id} ${statusStr}{/bold}{/${color}-fg}\n\n` +
+                        `Channel: #${Validator.sanitizeBlessedTags(job.channel)}\n` +
+                        `Messages: ${job.totalMessages.toLocaleString()}\n` +
+                        `Time: ${this.formatElapsed(job.duration || 0)}`,
+                        3
+                    );
+                }
+            });
 
-        if (!isPaused) {
-            this.spinnerFrame = (this.spinnerFrame + 1) % this.spinnerFrames.length;
+            const statusLabel = isPaused ? '{yellow-fg}PAUSED{/yellow-fg}' : '{green-fg}ACTIVE{/green-fg}';
+            this.widgets.summary.setContent(
+                ` Status: ${statusLabel}   Running: ${running}   Completed: ${completed}   Failed: ${failed}` +
+                (failed > 0 ? '   [!] Check failed jobs for errors' : '')
+            );
+
+            if (!isPaused) {
+                this.spinnerFrame = (this.spinnerFrame + 1) % this.spinnerFrames.length;
+            }
+            this.renderJobList(allJobs);
+
+            // Re-render the selected job's log
+            const selectedJob = allJobs.find(j => j.id === this.selectedJobId) || allJobs[0];
+            this.renderLog(selectedJob || null);
+        } catch (err) {
+            // Silently ignore update errors to keep the monitor alive
         }
-        this.renderJobList(allJobs);
+    }
 
-        // Re-render the selected job's log
-        const selectedJob = allJobs.find(j => j.id === this.selectedJobId) || allJobs[0];
-        this.renderLog(selectedJob || null);
+    cancelSelectedJob() {
+        const jobs = this.ctx.jobManager.getAllJobs();
+        const selected = jobs.find(j => j.id === this.selectedJobId);
+        if (!selected || selected.status !== 'running') return;
+        const ok = this.ctx.jobManager.requestCancel(selected.id);
+        if (ok) {
+            this.widgets.message.display(
+                `{yellow-fg}{bold}Cancellation requested{/bold}{/yellow-fg}\n\n` +
+                `Job #${selected.id} on #${Validator.sanitizeBlessedTags(selected.channel)}`,
+                2
+            );
+        }
     }
 
     setupKeyBindings() {
-        // Global key bindings for the main widget
-        this.widgets.main.key(['q', 'enter'], () => this.onBack());
+        // Global: escape/q goes back, enter has no global back (used for job selection)
+        this.widgets.main.key(['escape', 'q'], () => this.onBack());
 
         // Tab switches focus between list and log
         this.widgets.main.key(['tab'], () => {
@@ -314,6 +340,9 @@ export class LiveMonitor {
             }
             this.screen.render();
         });
+
+        // Job list: escape/q goes back, enter selects (handled by 'select item' event)
+        this.widgets.jobList.key(['escape', 'q'], () => this.onBack());
 
         // Arrow keys on job list update the log panel
         this.widgets.jobList.key(['up', 'down'], () => {
@@ -327,6 +356,7 @@ export class LiveMonitor {
                 }
             }, 10);
         });
+        this.widgets.jobList.key(['c'], () => this.cancelSelectedJob());
 
         // Scrolling keys for the log box
         this.widgets.logBox.key(['up', 'k'], () => {
@@ -348,9 +378,10 @@ export class LiveMonitor {
             this.widgets.logBox.scroll(this.widgets.logBox.height - 2);
             this.screen.render();
         });
+        this.widgets.logBox.key(['c'], () => this.cancelSelectedJob());
 
         // Allow exiting from log box
-        this.widgets.logBox.key(['q', 'enter', 'escape'], () => this.onBack());
+        this.widgets.logBox.key(['escape', 'q'], () => this.onBack());
 
         // Allow tab from log box
         this.widgets.logBox.key(['tab'], () => {

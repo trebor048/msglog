@@ -1,5 +1,5 @@
 import blessed from 'blessed';
-import { formatDuration } from '../../utils/utils.js';
+import { formatDuration, Validator } from '../../utils/utils.js';
 
 /**
  * Channel Management Screen
@@ -36,7 +36,7 @@ export class ChannelScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' UP/DOWN Navigate  ENTER Select  ? Help  Q Back'
+            content: ' UP/DOWN Navigate  ENTER Select  ? Help  ESC/Q Back'
         });
 
         this.showGuildList();
@@ -57,7 +57,7 @@ export class ChannelScreen {
         // Items are plain strings — no tags
         const items = guilds.map(g => {
             const count = g.channels.cache.filter(c => c.type === 'GUILD_TEXT' && c.viewable).size;
-            return `${g.name} (${count} channels)`;
+            return Validator.sanitizeBlessedTags(`${g.name} (${count} channels)`);
         });
         items.push('\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500');
         items.push('Back');
@@ -90,14 +90,14 @@ export class ChannelScreen {
             this.showChannelList(guilds[index]);
         });
 
-        this.widgets.list.key(['q', 'escape'], () => this.onBack());
+        this.widgets.list.key(['escape', 'q'], () => this.onBack());
     }
 
     showChannelList(guild) {
         if (this.widgets.list) this.widgets.list.destroy();
 
         // Header is plain text — no tags
-        this.widgets.header.setContent(` GUILD: ${guild.name.toUpperCase()}`);
+        this.widgets.header.setContent(` GUILD: ${Validator.sanitizeBlessedTags(guild.name).toUpperCase()}`);
 
         const channels = [...guild.channels.cache.values()]
             .filter(c => c.type === 'GUILD_TEXT' && c.viewable)
@@ -106,7 +106,7 @@ export class ChannelScreen {
         // Items are plain strings — no tags
         const items = channels.map(c => {
             const listening = this.ctx.listeningChannels.has(c.id);
-            return `${listening ? '[ON]' : '[OFF]'} #${c.name}`;
+            return `${listening ? '[ON]' : '[OFF]'} #${Validator.sanitizeBlessedTags(c.name)}`;
         });
         
         const separator = '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500';
@@ -154,7 +154,7 @@ export class ChannelScreen {
             this.showFetchOptions(channels[index]);
         });
 
-        this.widgets.list.key(['q', 'escape'], () => this.showGuildList());
+        this.widgets.list.key(['escape', 'q'], () => this.showGuildList());
     }
 
     handleGuildAction(guild, channels, action) {
@@ -183,7 +183,7 @@ export class ChannelScreen {
             .find(j => j.channelId === channel.id && j.status === 'running');
 
         // Header is plain text — no tags
-        this.widgets.header.setContent(` CHANNEL: #${channel.name.toUpperCase()}`);
+        this.widgets.header.setContent(` CHANNEL: #${Validator.sanitizeBlessedTags(channel.name).toUpperCase()}`);
 
         // Items are plain strings — no tags
         const items = [];
@@ -235,7 +235,7 @@ export class ChannelScreen {
             this.handleFetchAction(actions[index], channel, existingJob);
         });
 
-        this.widgets.list.key(['q', 'escape'], () => this.showChannelList(channel.guild));
+        this.widgets.list.key(['escape', 'q'], () => this.showChannelList(channel.guild));
     }
 
     handleFetchAction(action, channel, existingJob) {
@@ -315,11 +315,11 @@ export class ChannelScreen {
         const job = this.ctx.jobManager.createJob(channel, direction, null, null);
         this.ctx.syncEngine.syncChannelMessages(
             channel, direction, null, null, job.id,
-            this.ctx.withRetry, this.ctx.isShuttingDown, () => this.ctx.isPaused
+            this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
         );
         // showMessage uses a box with tags:true for colored content
         this.showMessage(
-            `{green-fg}Job #${job.id} started!{/green-fg}\n Fetching #${channel.name} (${direction})`,
+            `{green-fg}Job #${job.id} started!{/green-fg}\n Fetching #${Validator.sanitizeBlessedTags(channel.name)} (${direction})`,
             () => this.onBack()
         );
     }
@@ -333,32 +333,25 @@ export class ChannelScreen {
             border: { type: 'line' },
             style: { border: { fg: 'yellow' }, bg: 'black', fg: 'white' },
             label: ' Start date (YYYY-MM-DD or "start"): ',
-            inputOnFocus: true
+            inputOnFocus: true,
+            keys: true,
+            mouse: true
         });
 
-        // Set value and position cursor at the end
-        input.setValue(defaultValue);
-        input.focus();
-        
-        // Move cursor to end of text
-        setImmediate(() => {
-            if (input.screen && input.screen.program) {
-                input.screen.program.cursorPos(
-                    input.top + 1,
-                    input.left + 1 + defaultValue.length
-                );
-            }
-        });
-        
         this.screen.render();
 
-        input.on('submit', (startDate) => {
+        input.setValue(defaultValue);
+        input.focus();
+
+        input.key('enter', () => {
+            const startDate = input.getValue();
             input.destroy();
+            this.screen.render();
             if (!startDate) { this.showFetchOptions(channel); return; }
             const job = this.ctx.jobManager.createJob(channel, 'custom', startDate.trim(), 'now');
             this.ctx.syncEngine.syncChannelMessages(
                 channel, 'custom', startDate.trim(), 'now', job.id,
-                this.ctx.withRetry, this.ctx.isShuttingDown, () => this.ctx.isPaused
+                this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
             );
             this.showMessage(
                 `{green-fg}Custom job #${job.id} started!{/green-fg}`,
@@ -366,8 +359,9 @@ export class ChannelScreen {
             );
         });
 
-        input.on('cancel', () => {
+        input.key('escape', () => {
             input.destroy();
+            this.screen.render();
             this.showFetchOptions(channel);
         });
     }
@@ -376,7 +370,7 @@ export class ChannelScreen {
     showJobDetails(job, channel) {
         if (this.widgets.list) this.widgets.list.destroy();
 
-        let c = `\n{cyan-fg}{bold}Job #${job.id}{/bold}{/cyan-fg} — #${channel.name}\n`;
+        let c = `\n{cyan-fg}{bold}Job #${job.id}{/bold}{/cyan-fg} — #${Validator.sanitizeBlessedTags(channel.name)}\n`;
         c += `{gray-fg}` + '─'.repeat(40) + `{/gray-fg}\n\n`;
         c += ` Status:   {bold}${job.status}{/bold}\n`;
         c += ` Progress: {green-fg}${job.totalMessages}{/green-fg} messages\n`;
@@ -385,7 +379,9 @@ export class ChannelScreen {
         if (job.logs && job.logs.length) {
             c += `\n{cyan-fg}Recent Logs:{/cyan-fg}\n`;
             job.logs.slice(-5).forEach(log => {
-                c += ` {gray-fg}${log}{/gray-fg}\n`;
+                const ts = log?.timestamp ? new Date(log.timestamp).toLocaleTimeString() : '';
+                const message = Validator.sanitizeBlessedTags(String(log?.message ?? ''));
+                c += ` {gray-fg}${ts}{/gray-fg} ${message}\n`;
             });
         }
 
@@ -400,7 +396,7 @@ export class ChannelScreen {
             content: c
         });
 
-        this.widgets.list.key(['enter', 'q', 'escape'], () => this.showFetchOptions(channel));
+        this.widgets.list.key(['escape', 'q', 'enter'], () => this.showFetchOptions(channel));
         this.widgets.list.focus();
         this.screen.render();
     }
@@ -420,7 +416,7 @@ export class ChannelScreen {
             content: `\n ${msg}\n\n{gray-fg}Press Enter to continue{/gray-fg}`
         });
 
-        this.widgets.list.key(['enter'], () => callback());
+        this.widgets.list.key(['enter', 'escape', 'q'], () => callback());
         this.widgets.list.focus();
         this.screen.render();
     }

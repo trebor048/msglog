@@ -9,7 +9,7 @@ export class ScreenManager {
         this.screen = blessed.screen({
             mouse: true,
             keyboard: true,
-            title: '🤖 Discord Logger - msg-log',
+            title: 'Discord Logger - msg-log',
             smartCSR: true,
             style: {
                 border: { fg: 'cyan' },
@@ -18,26 +18,11 @@ export class ScreenManager {
             }
         });
 
-        // Handle exit
-        this.screen.key(['escape', 'C-c'], () => {
-            return process.exit(0);
+        // Route Ctrl+C through normal signal handling so graceful shutdown runs.
+        this.screen.key(['C-c'], () => {
+            process.kill(process.pid, 'SIGINT');
+            return;
         });
-
-        this.currentScreen = null;
-    }
-
-    /**
-     * Switch to a new screen
-     */
-    switchScreen(screenComponent) {
-        // Clear previous screen
-        if (this.currentScreen) {
-            this.currentScreen.destroy();
-        }
-
-        // Render new screen
-        this.currentScreen = screenComponent;
-        this.screen.render();
     }
 
     /**

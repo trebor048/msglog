@@ -1,4 +1,5 @@
 import blessed from 'blessed';
+import { Validator } from '../../utils/utils.js';
 
 /**
  * View Channels Screen
@@ -10,9 +11,11 @@ export class ViewChannelsScreen {
         this.ctx = ctx;
         this.onBack = onBack;
         this.widgets = {};
+        this.updateInterval = null;
 
         this.create();
         this.setupKeyBindings();
+        this.startUpdates();
     }
 
     create() {
@@ -50,10 +53,9 @@ export class ViewChannelsScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' ENTER/Q Back  ? Help'
+            content: ' ESC/Q/ENTER Back  ? Help'
         });
 
-        this.updateDisplay();
         this.widgets.content.focus();
     }
 
@@ -66,8 +68,10 @@ export class ViewChannelsScreen {
             this.ctx.listeningChannels.forEach(id => {
                 const ch = this.ctx.client.channels.cache.get(id);
                 if (ch) {
-                    const guild = ch.guild?.name ? ` {gray-fg}[${ch.guild.name}]{/gray-fg}` : '';
-                    c += `  {green-fg}• #${ch.name}{/green-fg}${guild}\n`;
+                    const guild = ch.guild?.name
+                        ? ` {gray-fg}[${Validator.sanitizeBlessedTags(ch.guild.name)}]{/gray-fg}`
+                        : '';
+                    c += `  {green-fg}• #${Validator.sanitizeBlessedTags(ch.name)}{/green-fg}${guild}\n`;
                 } else {
                     c += `  {gray-fg}• Unknown channel (${id}){/gray-fg}\n`;
                 }
@@ -86,7 +90,7 @@ export class ViewChannelsScreen {
                 const ch = this.ctx.client.channels.cache.get(cid);
                 const jobs = activeRunning.filter(j => j.channelId === cid).map(j => `#${j.id}`).join(', ');
                 if (ch) {
-                    c += `  {blue-fg}• #${ch.name}{/blue-fg} {gray-fg}(Jobs: ${jobs}){/gray-fg}\n`;
+                    c += `  {blue-fg}• #${Validator.sanitizeBlessedTags(ch.name)}{/blue-fg} {gray-fg}(Jobs: ${jobs}){/gray-fg}\n`;
                 }
             });
         } else {
@@ -98,10 +102,16 @@ export class ViewChannelsScreen {
     }
 
     setupKeyBindings() {
-        this.widgets.content.key(['enter', 'q', 'escape'], () => this.onBack());
+        this.widgets.content.key(['escape', 'q', 'enter'], () => this.onBack());
+    }
+
+    startUpdates() {
+        this.updateDisplay();
+        this.updateInterval = setInterval(() => this.updateDisplay(), 1000);
     }
 
     destroy() {
+        if (this.updateInterval) clearInterval(this.updateInterval);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

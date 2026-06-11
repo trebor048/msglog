@@ -75,7 +75,7 @@ export class ConfigScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' UP/DOWN Navigate  ENTER Select  ? Help  Q Back'
+            content: ' UP/DOWN Navigate  ENTER Select  ? Help  ESC/Q Back'
         });
 
         this.widgets.menu.focus();
@@ -88,7 +88,11 @@ export class ConfigScreen {
         c += ` Database:       {green-fg}${this.config.databaseFile}{/green-fg}\n`;
         c += ` Global Delay:   {green-fg}${this.config.globalDelay}ms{/green-fg}\n`;
         c += ` Max Fast Req:   {green-fg}${this.config.maxFastRequests}{/green-fg}\n`;
+        c += ` RL Channels:    {green-fg}${this.config.maxRateLimitChannels}{/green-fg}\n`;
+        c += ` Max Sync Pages: {green-fg}${this.config.maxSyncPages}{/green-fg}\n`;
         c += ` Jitter:         {green-fg}${this.config.randomDelayMin}-${this.config.randomDelayMax}ms{/green-fg}\n`;
+        c += ` Event Queue:    {green-fg}${this.config.maxEventQueueSize}{/green-fg}\n`;
+        c += ` Retention Days: {green-fg}${this.config.deletedRetentionDays}{/green-fg}\n`;
         c += ` Downloads:      {${this.config.downloadAttachments ? 'green' : 'red'}-fg}${this.config.downloadAttachments ? 'ENABLED' : 'DISABLED'}{/${this.config.downloadAttachments ? 'green' : 'red'}-fg}\n`;
         c += ` DL Timeout:     {green-fg}${this.config.downloadTimeoutSeconds}s{/green-fg}\n`;
         return c;
@@ -103,33 +107,56 @@ export class ConfigScreen {
     }
 
     editDatabase() {
-        this.promptInput('Database file path (.db):', this.config.databaseFile, (val) => {
+        this.promptInput('Database file path (.db):', this.config.databaseFile, async (val) => {
             if (!val.endsWith('.db')) {
                 this.widgets.output.setContent('\n{red-fg}Error: File must end with .db{/red-fg}');
+                this.widgets.menu.focus();
+                this.screen.render();
                 return;
             }
-            this.config.databaseFile = val;
-            saveConfig(this.config);
-            this.widgets.output.setContent(
-                '\n{yellow-fg}Saved! Restart required for DB path change.{/yellow-fg}\n\n' +
-                this.getCurrentConfigDisplay()
-            );
+            try {
+                // Validate path stays within project directory
+                Validator.validateDatabasePath(val, process.cwd());
+                this.config.databaseFile = val;
+                await saveConfig(this.config);
+                this.widgets.output.setContent(
+                    '\n{green-fg}Saved! Restart required for DB path change.{/green-fg}\n\n' +
+                    this.getCurrentConfigDisplay()
+                );
+            } catch (err) {
+                this.widgets.output.setContent(
+                    `\n{red-fg}Invalid path: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`
+                );
+            }
+            this.widgets.menu.focus();
+            this.screen.render();
         });
     }
 
     editDelays() {
         const fields = [
-            { key: 'globalDelay', label: 'Global delay (ms)', min: 0, max: 30000 },
+            { key: 'globalDelay', label: 'Global delay (ms)', min: 50, max: 30000 },
             { key: 'maxFastRequests', label: 'Max fast requests', min: 1, max: 1000 },
+            { key: 'maxRateLimitChannels', label: 'Max rate-limit channels', min: 100, max: 500000 },
+            { key: 'maxSyncPages', label: 'Max sync pages', min: 1, max: 1000000 },
             { key: 'randomDelayMin', label: 'Random delay min (ms)', min: 0, max: 30000 },
-            { key: 'randomDelayMax', label: 'Random delay max (ms)', min: 0, max: 30000 }
+            { key: 'randomDelayMax', label: 'Random delay max (ms)', min: 0, max: 30000 },
+            { key: 'maxEventQueueSize', label: 'Max event queue size', min: 100, max: 100000 },
+            { key: 'deletedRetentionDays', label: 'Deleted retention days', min: 1, max: 3650 }
         ];
         this.editFieldChain(fields, 0);
     }
 
-    editFieldChain(fields, idx) {
+    async editFieldChain(fields, idx) {
         if (idx >= fields.length) {
-            saveConfig(this.config);
+            if (this.config.randomDelayMin > this.config.randomDelayMax) {
+                this.widgets.output.setContent('\n{red-fg}Invalid jitter: min must be less than or equal to max{/red-fg}');
+                this.widgets.menu.focus();
+                this.screen.render();
+                return;
+            }
+
+            await saveConfig(this.config);
             this.widgets.output.setContent(
                 '\n{green-fg}Delays updated and saved.{/green-fg}\n\n' +
                 this.getCurrentConfigDisplay()
@@ -140,16 +167,18 @@ export class ConfigScreen {
         }
 
         const field = fields[idx];
-        this.promptInput(`${field.label}:`, String(this.config[field.key]), (val) => {
+        this.promptInput(`${field.label}:`, String(this.config[field.key]), async (val) => {
             const num = parseInt(val, 10);
             if (isNaN(num) || num < field.min || num > field.max) {
                 this.widgets.output.setContent(
                     `\n{red-fg}Invalid value (must be ${field.min}–${field.max}){/red-fg}`
                 );
+                this.widgets.menu.focus();
+                this.screen.render();
                 return;
             }
             this.config[field.key] = num;
-            this.editFieldChain(fields, idx + 1);
+            await this.editFieldChain(fields, idx + 1);
         });
     }
 
@@ -174,19 +203,23 @@ export class ConfigScreen {
         dialog.focus();
         this.screen.render();
 
-        dialog.on('select', (item, index) => {
+        dialog.on('select', async (item, index) => {
             dialog.destroy();
             this.config.downloadAttachments = (index === 0);
-            saveConfig(this.config);
-            this.widgets.output.setContent(
-                '\n{green-fg}Download setting saved.{/green-fg}\n\n' +
-                this.getCurrentConfigDisplay()
-            );
+            try {
+                await saveConfig(this.config);
+                this.widgets.output.setContent(
+                    '\n{green-fg}Download setting saved.{/green-fg}\n\n' +
+                    this.getCurrentConfigDisplay()
+                );
+            } catch (err) {
+                this.widgets.output.setContent(`\n{red-fg}Save failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
+            }
             this.widgets.menu.focus();
             this.screen.render();
         });
 
-        dialog.key(['q', 'escape'], () => {
+        dialog.key(['escape', 'q'], () => {
             dialog.destroy();
             this.widgets.menu.focus();
             this.screen.render();
@@ -201,41 +234,43 @@ export class ConfigScreen {
             border: { type: 'line' },
             style: { border: { fg: 'yellow' }, bg: 'black', fg: 'white' },
             label: ` ${label} `,
-            inputOnFocus: true
+            inputOnFocus: true,
+            keys: true,
+            mouse: true
         });
 
-        // Set value and position cursor at the end
-        input.setValue(defaultVal);
-        input.focus();
-        
-        // Move cursor to end of text
-        setImmediate(() => {
-            if (input.screen && input.screen.program) {
-                input.screen.program.cursorPos(
-                    input.top + 1,
-                    input.left + 1 + defaultVal.length
-                );
-            }
-        });
-        
+        // Render first so dimensions are calculated, then set value & focus
         this.screen.render();
 
-        input.on('submit', (val) => {
+        input.setValue(defaultVal);
+        input.focus();
+
+        // Handle submit (Enter) explicitly via key binding to ensure
+        // it is consumed and does not propagate to screen-level handlers
+        input.key('enter', () => {
+            const val = input.getValue() || defaultVal;
             input.destroy();
-            callback(val || defaultVal);
-            this.widgets.menu.focus();
             this.screen.render();
+            Promise.resolve(callback(val)).catch(err => {
+                this.widgets.output.setContent(`\n{red-fg}Save failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
+                this.widgets.menu.focus();
+                this.screen.render();
+            });
         });
 
-        input.on('cancel', () => {
+        // Handle cancel (Escape) the same way
+        input.key('escape', () => {
             input.destroy();
-            this.widgets.menu.focus();
+            this.screen.render();
+            if (!this.widgets.menu.destroyed) {
+                this.widgets.menu.focus();
+            }
             this.screen.render();
         });
     }
 
     setupKeyBindings() {
-        this.widgets.menu.key(['q', 'escape'], () => this.onBack());
+        this.widgets.menu.key(['escape', 'q'], () => this.onBack());
     }
 
     destroy() {

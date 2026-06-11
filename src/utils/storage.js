@@ -3,7 +3,7 @@ import axios from 'axios';
 import { createWriteStream } from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
-import { getFileExtension } from './utils.js';
+import { getFileExtension, Validator } from './utils.js';
 
 // ============ MESSAGE STORAGE ============
 const MAX_SQLITE_PARAMS = 900;
@@ -24,10 +24,8 @@ export class MessageStore {
 
     _getInsertStatement() {
         if (!this.insertStmt && this.db) {
-            // INSERT OR REPLACE so the after-insert trigger always fires for FTS.
-            // OR REPLACE on a duplicate id = delete old row + insert new row,
-            // which is fine because message content doesn't change (edits go through updateMessageContent).
-            // We guard against unnecessary re-inserts by deduping in the sync engine first.
+            // INSERT OR IGNORE prevents duplicate row writes for already-stored IDs.
+            // The sync engine deduplicates before insert to minimize ignored writes.
             this.insertStmt = this.db.prepare(`
                 INSERT OR IGNORE INTO messages
                 (id, author_id, author_tag, content, timestamp, channel_id,
@@ -100,8 +98,10 @@ export class MessageStore {
     }
 
     async storeMessagesBatch(messages, channel, withRetry, downloadAttachmentFn, processEmbedsFn, isShuttingDown) {
-        const shouldShutdown = typeof isShuttingDown === 'function' ? isShuttingDown() : isShuttingDown;
-        if (!messages.length || !this.db || shouldShutdown) return;
+        const isShutdownRequested = typeof isShuttingDown === 'function'
+            ? isShuttingDown
+            : () => Boolean(isShuttingDown);
+        if (!messages.length || !this.db || isShutdownRequested()) return;
 
         const insert = this._getInsertStatement();
         if (!insert) return;
@@ -109,6 +109,7 @@ export class MessageStore {
         try {
             const rows = [];
             for (const msg of messages) {
+                if (isShutdownRequested()) break;
                 const refContent = await this.fetchReferenceContent(msg, channel, withRetry);
                 const attachmentData = await this.buildAttachmentData(msg, downloadAttachmentFn);
                 const processedEmbeds = processEmbedsFn
@@ -126,10 +127,18 @@ export class MessageStore {
                     embeds: JSON.stringify(processedEmbeds),
                     reference_message_id: msg.reference?.messageId ?? null,
                     reference_message_content: refContent,
-                    reactions: JSON.stringify([]),
+                    reactions: JSON.stringify(
+                        msg.reactions?.cache
+                            ? [...msg.reactions.cache.entries()].map(([emoji, reaction]) => ({
+                                emoji: emoji.toString(),
+                                count: reaction.count
+                            }))
+                            : []
+                    ),
                     is_bot: msg.author.bot ? 1 : 0
                 });
             }
+            if (!rows.length) return;
 
             const txn = this.db.transaction(rows => { for (const row of rows) insert.run(row); });
             txn(rows);
@@ -147,6 +156,7 @@ export class MessageStore {
                 this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
             }
             console.error(chalk.red('❌ DB batch insert error:', err.message));
+            throw err;
         }
     }
 
@@ -299,8 +309,9 @@ export async function downloadAttachment(url, channelId, filename, withRetry, co
         }
 
         const unsafeExtensions = ['.exe', '.bat', '.cmd', '.ps1', '.sh', '.js', '.vbs'];
-        const ext = path.extname(filename).toLowerCase();
-        if (unsafeExtensions.some(ext => filename.toLowerCase().endsWith(ext))) {
+        const safeOriginalFilename = Validator.sanitizeFilename(path.basename(String(filename || 'attachment')));
+        const sanitizedFilename = safeOriginalFilename || 'attachment';
+        if (unsafeExtensions.some(ext => sanitizedFilename.toLowerCase().endsWith(ext))) {
             console.log(chalk.yellow(`⚠️ Skipping potentially unsafe file: ${filename}`));
             return null;
         }
@@ -308,17 +319,19 @@ export async function downloadAttachment(url, channelId, filename, withRetry, co
         if (size > 10 * 1024 * 1024)
             console.log(chalk.blue(`📁 Large file: ${filename} (${(size / 1024 / 1024).toFixed(1)} MB)`));
 
-        const contentDir = path.join('content', channelId);
+        const safeChannelId = Validator.sanitizeFilename(String(channelId));
+        const contentDir = Validator.validatePathConfinement(safeChannelId, 'content');
         await fs.mkdir(contentDir, { recursive: true });
 
-        let finalFilename = filename;
+        let finalFilename = sanitizedFilename;
         if (messageId) {
-            const ext = path.extname(filename);
-            const base = path.basename(filename, ext);
-            finalFilename = `${base}_${messageId}${ext}`;
+            const fileExt = path.extname(sanitizedFilename);
+            const base = path.basename(sanitizedFilename, fileExt);
+            const safeMessageId = Validator.sanitizeFilename(String(messageId));
+            finalFilename = `${base}_${safeMessageId}${fileExt}`;
         }
 
-        const filePath = path.join(contentDir, finalFilename);
+        const filePath = Validator.validatePathConfinement(finalFilename, contentDir);
 
         try {
             await fs.access(filePath);

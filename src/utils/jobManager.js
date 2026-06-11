@@ -21,7 +21,8 @@ export class JobManager {
             logs: [],
             recentMessages: [],
             startTime: Date.now(),
-            totalMessages: 0
+            totalMessages: 0,
+            cancelRequested: false
         };
         this.activeJobs.set(jobId, job);
         this.totalJobs++;
@@ -56,7 +57,10 @@ export class JobManager {
         if (status !== 'running') {
             job.endTime = Date.now();
             job.duration = job.endTime - job.startTime;
-            setTimeout(() => this.activeJobs.delete(jobId), 10 * 60 * 1000); // keep for 10 min
+            const cleanupTimer = setTimeout(() => this.activeJobs.delete(jobId), 10 * 60 * 1000); // keep for 10 min
+            if (typeof cleanupTimer.unref === 'function') {
+                cleanupTimer.unref();
+            }
         }
     }
 
@@ -64,6 +68,23 @@ export class JobManager {
         const job = this.activeJobs.get(jobId);
         if (!job) return;
         job.error = errorMessage;
+    }
+
+    requestCancel(jobId, reason = 'Cancelled by user') {
+        const job = this.activeJobs.get(jobId);
+        if (!job || job.status !== 'running') return false;
+        job.cancelRequested = true;
+        this.logToJob(jobId, `🛑 ${reason}`);
+        return true;
+    }
+
+    isCancelRequested(jobId) {
+        const job = this.activeJobs.get(jobId);
+        return Boolean(job?.cancelRequested);
+    }
+
+    getJob(jobId) {
+        return this.activeJobs.get(jobId) || null;
     }
 
     channelHasActiveJob(channelId) {

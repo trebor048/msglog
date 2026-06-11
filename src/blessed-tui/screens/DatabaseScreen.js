@@ -1,5 +1,5 @@
 import blessed from 'blessed';
-import { TuiSpinner } from '../../utils/utils.js';
+import { TuiSpinner, Validator } from '../../utils/utils.js';
 
 /**
  * Database Management Screen
@@ -52,6 +52,7 @@ export class DatabaseScreen {
                 'View Statistics',
                 'Optimize (VACUUM)',
                 'Check Integrity',
+                'Cleanup Preview',
                 'Cleanup Old Messages',
                 'Rebuild Indexes',
                 'Rebuild FTS Search Index',
@@ -84,7 +85,7 @@ export class DatabaseScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' UP/DOWN Navigate  ENTER Select  ? Help  Q Back'
+            content: ' UP/DOWN Navigate  ENTER Select  ? Help  ESC/Q Back'
         });
 
         this.widgets.menu.focus();
@@ -102,7 +103,12 @@ export class DatabaseScreen {
                 const ok = this.dbManager.checkIntegrity();
                 return ok ? 'Integrity check passed' : 'Integrity check FAILED';
             }),
-            () => this.confirmAction('Cleanup deleted messages older than 30 days?', () => {
+            () => this.runAction('Previewing cleanup...', () => {
+                const n = this.dbManager.previewCleanup();
+                const retentionDays = this.ctx.config?.deletedRetentionDays ?? 30;
+                return `${n} deleted message(s) would be removed (older than ${retentionDays} days)`;
+            }),
+            () => this.confirmAction(`Cleanup deleted messages older than ${this.ctx.config?.deletedRetentionDays ?? 30} days?`, () => {
                 const n = this.dbManager.cleanup();
                 return `Removed ${n} old messages`;
             }),
@@ -143,7 +149,7 @@ export class DatabaseScreen {
             c += ` Database Size:   {cyan-fg}${stats.databaseSize.toFixed(2)} MB{/cyan-fg}\n`;
             this.widgets.output.setContent(c);
         } catch (err) {
-            this.widgets.output.setContent(`\n{red-fg}Error: ${err.message}{/red-fg}`);
+            this.widgets.output.setContent(`\n{red-fg}Error: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
         }
         this.widgets.menu.focus();
         this.screen.render();
@@ -163,7 +169,7 @@ export class DatabaseScreen {
             }
             this.widgets.output.setContent(c);
         } catch (err) {
-            this.widgets.output.setContent(`\n{red-fg}Error: ${err.message}{/red-fg}`);
+            this.widgets.output.setContent(`\n{red-fg}Error: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
         }
         this.widgets.menu.focus();
         this.screen.render();
@@ -183,7 +189,7 @@ export class DatabaseScreen {
             }
             this.widgets.output.setContent(c);
         } catch (err) {
-            this.widgets.output.setContent(`\n{red-fg}Error: ${err.message}{/red-fg}`);
+            this.widgets.output.setContent(`\n{red-fg}Error: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
         }
         this.widgets.menu.focus();
         this.screen.render();
@@ -204,7 +210,7 @@ export class DatabaseScreen {
             this.widgets.output.setContent(`\n{${ok ? 'red' : 'green'}-fg}${res}{/${ok ? 'red' : 'green'}-fg}`);
         } catch (err) {
             spinner.stop(false);
-            this.widgets.output.setContent(`\n{red-fg}Action failed: ${err.message}{/red-fg}`);
+            this.widgets.output.setContent(`\n{red-fg}Action failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
         }
         
         this.widgets.menu.focus();
@@ -243,7 +249,7 @@ export class DatabaseScreen {
             }
         });
 
-        dialog.key(['q', 'escape'], () => {
+        dialog.key(['escape', 'q'], () => {
             dialog.destroy();
             this.widgets.menu.focus();
             this.screen.render();
@@ -251,7 +257,7 @@ export class DatabaseScreen {
     }
 
     setupKeyBindings() {
-        this.widgets.menu.key(['q', 'escape'], () => this.onBack());
+        this.widgets.menu.key(['escape', 'q'], () => this.onBack());
     }
 
     destroy() {

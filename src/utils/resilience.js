@@ -1,4 +1,4 @@
-import { sleepJitter } from './utils.js';
+import { sleep, sleepJitter } from './utils.js';
 
 // ============ CIRCUIT BREAKER ============
 // Only trips on persistent/unexpected errors, NOT on rate limits or transient Discord errors.
@@ -100,9 +100,10 @@ export function createWithRetry(config, circuitBreaker) {
                 return await circuitBreaker.call(fn);
             } catch (err) {
                 lastErr = err;
+                const errMessage = typeof err?.message === 'string' ? err.message : '';
 
                 // Never retry if circuit breaker is open
-                if (err.message.startsWith('Circuit breaker is open')) {
+                if (errMessage.startsWith('Circuit breaker is open')) {
                     throw err;
                 }
 
@@ -133,10 +134,43 @@ export class AdaptiveRateLimiter {
     constructor(config) {
         this.config = config;
         this.globalDelay = config.globalDelay;
+        this.randomDelayMin = Math.max(0, Number(config.randomDelayMin ?? 0));
+        this.randomDelayMax = Math.max(this.randomDelayMin, Number(config.randomDelayMax ?? this.randomDelayMin));
+        this.maxRateLimitChannels = Math.max(100, Number(config.maxRateLimitChannels ?? 10000));
         this.perChannelDelays = new Map();
         this.perChannelLastRequestTime = new Map();
+        this.channelLru = new Map();
         this.lastRequestTime = 0;
         this.consecutiveFastRequests = 0;
+    }
+
+    _touchChannel(channelId) {
+        if (!channelId || channelId === 'global') return;
+        if (this.channelLru.has(channelId)) {
+            this.channelLru.delete(channelId);
+        }
+        this.channelLru.set(channelId, Date.now());
+        this._pruneChannelState();
+    }
+
+    _pruneChannelState() {
+        while (this.channelLru.size > this.maxRateLimitChannels) {
+            const oldest = this.channelLru.keys().next().value;
+            if (oldest === undefined) break;
+            this.channelLru.delete(oldest);
+            this.perChannelDelays.delete(oldest);
+            this.perChannelLastRequestTime.delete(oldest);
+        }
+    }
+
+    _randomDelayMs() {
+        if (this.randomDelayMax <= this.randomDelayMin) return this.randomDelayMin;
+        return Math.floor(Math.random() * (this.randomDelayMax - this.randomDelayMin + 1)) + this.randomDelayMin;
+    }
+
+    _computeWaitDuration(delay, elapsed) {
+        const baseWait = Math.max(0, delay - elapsed);
+        return baseWait > 0 ? baseWait + this._randomDelayMs() : 0;
     }
 
     async wait(channelId = 'global') {
@@ -154,7 +188,7 @@ export class AdaptiveRateLimiter {
                 this.globalDelay = Math.min(this.globalDelay * 1.5, 2000);
                 this.consecutiveFastRequests = 0;
             }
-            await sleepJitter(delay - elapsed);
+            await sleep(this._computeWaitDuration(delay, elapsed));
         } else {
             this.consecutiveFastRequests = Math.max(0, this.consecutiveFastRequests - 1);
         }
@@ -164,6 +198,7 @@ export class AdaptiveRateLimiter {
             this.lastRequestTime = now;
         } else {
             this.perChannelLastRequestTime.set(channelId, now);
+            this._touchChannel(channelId);
         }
     }
 
@@ -177,6 +212,7 @@ export class AdaptiveRateLimiter {
                 channelId,
                 Math.max(this.perChannelDelays.get(channelId) ?? this.globalDelay, delay)
             );
+            this._touchChannel(channelId);
         }
     }
 }

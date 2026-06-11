@@ -1,3 +1,4 @@
+import blessed from 'blessed';
 import ScreenManager from './core/screen.js';
 import MainMenu from './screens/MainMenu.js';
 import LiveMonitor from './screens/LiveMonitor.js';
@@ -11,6 +12,20 @@ import ChannelScreen from './screens/ChannelScreen.js';
 import ViewChannelsScreen from './screens/ViewChannelsScreen.js';
 import SystemInfoScreen from './screens/SystemInfoScreen.js';
 import { sleep } from '../utils/utils.js';
+import { startAutoSync, stopAutoSync } from '../utils/autosync.js';
+
+// Table-driven action dispatch — add new screens here, no switch-statement changes needed
+const ACTION_SCREENS = {
+    'view-channels':    ViewChannelsScreen,
+    'manage-channels':  ChannelScreen,
+    'stats':            StatsScreen,
+    'search':           SearchScreen,
+    'export':           ExportScreen,
+    'database':         DatabaseScreen,
+    'system-info':      SystemInfoScreen,
+    'config':           ConfigScreen,
+    'health-check':     HealthScreen,
+};
 
 /**
  * Main TUI Application
@@ -69,7 +84,7 @@ export class BlessedTUIApp {
                 ' {yellow-fg}CTRL+S{/yellow-fg}      Search Messages\n' +
                 ' {yellow-fg}CTRL+E{/yellow-fg}      Export Data\n' +
                 ' {yellow-fg}CTRL+V{/yellow-fg}      View Channels\n' +
-                ' {yellow-fg}Q / ESC{/yellow-fg}      Back / Close Overlay\n\n' +
+                ' {yellow-fg}ESC / Q{/yellow-fg}      Back / Close Overlay\n\n' +
                 '{cyan-fg}{bold}Navigation{/bold}{/cyan-fg}\n' +
                 ' {yellow-fg}Arrows / HJ KL{/yellow-fg} Navigate lists\n' +
                 ' {yellow-fg}ENTER{/yellow-fg}           Select / Confirm\n' +
@@ -82,12 +97,12 @@ export class BlessedTUIApp {
         const close = () => {
             helpBox.destroy();
             screen.render();
+            // onceKey auto-unregisters on fire, but click path needs explicit cleanup
             screen.removeKey(['escape', 'q', 'enter', 'space'], close);
-            // Re-focus current screen's main widget if possible
-            if (this.currentScreen && this.currentScreen.widgets && this.currentScreen.widgets.menu) {
-                this.currentScreen.widgets.menu.focus();
-            } else if (this.currentScreen && this.currentScreen.widgets && this.currentScreen.widgets.main) {
-                this.currentScreen.widgets.main.focus();
+            // Re-focus current screen's main interactive widget
+            if (this.currentScreen?.widgets) {
+                const w = this.currentScreen.widgets;
+                (w.menu || w.jobList || w.table || w.health || w.content || w.main)?.focus();
             }
         };
 
@@ -107,15 +122,13 @@ export class BlessedTUIApp {
 
     async handleAction(action) {
         try {
+            // Table-driven screen dispatch
+            if (ACTION_SCREENS[action]) {
+                this.showScreen(ACTION_SCREENS[action]);
+                return;
+            }
+
             switch (action) {
-                case 'view-channels':
-                    this.showScreen(ViewChannelsScreen);
-                    break;
-
-                case 'manage-channels':
-                    this.showScreen(ChannelScreen);
-                    break;
-
                 case 'toggle-pause':
                     this.handleTogglePause();
                     break;
@@ -128,36 +141,8 @@ export class BlessedTUIApp {
                     await this.handleToggleAutosync();
                     break;
 
-                case 'stats':
-                    this.showScreen(StatsScreen);
-                    break;
-
                 case 'live-monitor':
                     this.showLiveMonitor();
-                    break;
-
-                case 'search':
-                    this.showScreen(SearchScreen);
-                    break;
-
-                case 'export':
-                    this.showScreen(ExportScreen);
-                    break;
-
-                case 'database':
-                    this.showScreen(DatabaseScreen);
-                    break;
-
-                case 'system-info':
-                    this.showScreen(SystemInfoScreen);
-                    break;
-
-                case 'config':
-                    this.showScreen(ConfigScreen);
-                    break;
-
-                case 'health-check':
-                    this.showScreen(HealthScreen);
                     break;
 
                 case 'exit':
@@ -204,7 +189,7 @@ export class BlessedTUIApp {
                 this.ctx.client,
                 this.ctx.listeningChannels,
                 this.ctx.withRetry,
-                this.ctx.isShuttingDown,
+                () => this.ctx.isShuttingDown,
                 () => this.ctx.isPaused
             ).catch(err => console.error('Sync error:', err));
             this.showLiveMonitor();
@@ -225,7 +210,7 @@ export class BlessedTUIApp {
             this.ctx.client,
             this.ctx.listeningChannels,
             this.ctx.withRetry,
-            this.ctx.isShuttingDown,
+            () => this.ctx.isShuttingDown,
             () => this.ctx.isPaused
         ).catch(err => console.error('Sync error:', err));
 
@@ -233,8 +218,6 @@ export class BlessedTUIApp {
     }
 
     async handleToggleAutosync() {
-        const { startAutoSync, stopAutoSync } = await import('../utils/index.js');
-
         if (this.ctx.autoSyncEnabled) {
             stopAutoSync(this.ctx);
             this.ctx.dbManager?.saveAutoSync(false, this.ctx.autoSyncIntervalMs);
@@ -252,7 +235,6 @@ export class BlessedTUIApp {
         this.isRunning = false;
         this.cleanup();
         await this.ctx.gracefulShutdown('user exit');
-        process.exit(0);
     }
 
     cleanup() {

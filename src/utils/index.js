@@ -8,47 +8,16 @@ import { CircuitBreaker, createWithRetry, AdaptiveRateLimiter } from './resilien
 import { JobManager } from './jobManager.js';
 import { MessageStore, downloadAttachment, processEmbeds } from './storage.js';
 import { SyncEngine } from './syncEngine.js';
-import { setupEventHandlers, setupShutdownHandlers, createGracefulShutdown } from './lifecycle.js';
+import { setupEventHandlers, setupShutdownHandlers, createGracefulShutdown, setupProcessErrorHandlers } from './lifecycle.js';
 import startBlessedTUI from '../blessed-tui/index.js';
 import { MessageSearch, MessageExporter, DatabaseManager } from './data.js';
 import { PerformanceManager } from './performance.js';
 import { Logger } from './logger.js';
 import { Validator } from './utils.js';
+import { startAutoSync } from './autosync.js';
+import { handleFatalStartup } from './startupCleanup.js';
 
 dotenv.config();
-
-// Autosync helper functions
-function startAutoSync(ctx) {
-    if (ctx.autoSyncEnabled || !ctx.listeningChannels.size) return;
-    
-    ctx.autoSyncEnabled = true;
-    console.log(chalk.green(`✅ Autosync enabled (every ${ctx.autoSyncIntervalMs / 1000 / 60} minutes)`));
-
-    const runSync = async () => {
-        if (ctx.isShuttingDown || ctx.isPaused) return;
-        
-        const running = ctx.jobManager.getAllJobs().filter(j => j.status === 'running');
-        if (running.length >= ctx.config.maxConcurrentJobs) return;
-        
-        await ctx.syncEngine.syncAllChannelsParallel(ctx.client, ctx.listeningChannels, ctx.withRetry, ctx.isShuttingDown, () => ctx.isPaused);
-    };
-
-    // Run immediately on startup
-    runSync();
-    
-    ctx.autoSyncInterval = setInterval(runSync, ctx.autoSyncIntervalMs);
-}
-
-function stopAutoSync(ctx) {
-    if (!ctx.autoSyncEnabled) return;
-    
-    ctx.autoSyncEnabled = false;
-    if (ctx.autoSyncInterval) {
-        clearInterval(ctx.autoSyncInterval);
-        ctx.autoSyncInterval = null;
-    }
-    console.log(chalk.yellow('⏹️ Autosync disabled'));
-}
 
 // Application context container - reduces parameter passing
 class AppContext {
@@ -76,10 +45,26 @@ class AppContext {
         this.autoSyncEnabled = false;
         this.autoSyncInterval = null;
         this.autoSyncIntervalMs = 60 * 60 * 1000; // 1 hour default
+        this.teardownEventHandlers = null;
+        this.teardownShutdownHandlers = null;
+        this.teardownProcessErrorHandlers = null;
+        this.runtimeMetrics = {
+            eventQueueSize: 0,
+            maxEventQueueSize: config.maxEventQueueSize ?? 2000,
+            queuedMessagesDropped: 0,
+            queuedMessagesProcessed: 0
+        };
     }
 }
 
 async function bootstrap() {
+    let client = null;
+    let db = null;
+    let logger = null;
+    let teardownProcessErrorHandlers = null;
+    let teardownEventHandlers = null;
+    let teardownShutdownHandlers = null;
+
     try {
         // Validate environment
         if (!process.env.USER_TOKEN) {
@@ -94,10 +79,10 @@ async function bootstrap() {
         }
 
         // Initialize Discord client
-        const client = new Client({ checkUpdate: false, syncStatus: false });
+        client = new Client({ checkUpdate: false, syncStatus: false });
 
         // Initialize database
-        const db = initDatabase(config);
+        db = initDatabase(config);
 
         // Initialize resilience patterns
         const circuitBreaker = new CircuitBreaker(5, 60000);
@@ -107,8 +92,8 @@ async function bootstrap() {
         // Initialize managers and stores
         const jobManager = new JobManager();
         const performance = new PerformanceManager();
-        const logger = new Logger();
-        const dbManager = new DatabaseManager(db, performance);
+        logger = new Logger();
+        const dbManager = new DatabaseManager(db, performance, config);
         const messageStore = new MessageStore(db, config, performance);
 
         // Load persisted state
@@ -136,6 +121,8 @@ async function bootstrap() {
 
         const gracefulShutdown = await createGracefulShutdown(client, db, jobManager, ctx, logger);
         ctx.gracefulShutdown = gracefulShutdown;
+        ctx.teardownProcessErrorHandlers = setupProcessErrorHandlers(gracefulShutdown, logger);
+        teardownProcessErrorHandlers = ctx.teardownProcessErrorHandlers;
 
         // Wire up Discord rate-limit events to adaptive rate limiter
         client.on('rateLimit', info => {
@@ -146,7 +133,8 @@ async function bootstrap() {
         });
 
         // Setup shutdown handlers
-        setupShutdownHandlers(client, db, jobManager, ctx, gracefulShutdown);
+        ctx.teardownShutdownHandlers = setupShutdownHandlers(client, db, jobManager, ctx, gracefulShutdown);
+        teardownShutdownHandlers = ctx.teardownShutdownHandlers;
 
         // Create dependency-injected store function
         const storeMessagesWithDeps = async (messages, channel) => {
@@ -165,13 +153,28 @@ async function bootstrap() {
         };
 
         // Setup event handlers
-        setupEventHandlers(client, listeningChannels, messageStore, () => ctx.isPaused, storeMessagesWithDeps, logger);
+        ctx.teardownEventHandlers = setupEventHandlers(
+            client,
+            listeningChannels,
+            messageStore,
+            () => ctx.isPaused,
+            storeMessagesWithDeps,
+            logger,
+            config,
+            ctx.runtimeMetrics
+        );
+        teardownEventHandlers = ctx.teardownEventHandlers;
 
         // Login and start
-        client.login(process.env.USER_TOKEN).catch(err => {
-            console.error(chalk.red('❌ Login failed:', err.message));
-            logger?.error('Login failed', { error: err.message });
-            process.exit(1);
+        client.login(process.env.USER_TOKEN).catch(async err => {
+            await handleFatalStartup('Login failed', err, {
+                client,
+                db,
+                logger,
+                teardownProcessErrorHandlers,
+                teardownEventHandlers,
+                teardownShutdownHandlers
+            });
         });
 
         client.once('ready', () => {
@@ -183,16 +186,20 @@ async function bootstrap() {
             startBlessedTUI(ctx).catch(err => {
                 console.error(chalk.red('❌ TUI error:', err.message));
                 logger?.error('TUI error', { error: err.message });
-                gracefulShutdown('tui error');
+                gracefulShutdown('tui error', { exitCode: 1 });
             });
         });
 
     } catch (err) {
-        console.error(chalk.red('❌ Bootstrap error:', err.message));
-        process.exit(1);
+        await handleFatalStartup('Bootstrap error', err, {
+            client,
+            db,
+            logger,
+            teardownProcessErrorHandlers,
+            teardownEventHandlers,
+            teardownShutdownHandlers
+        });
     }
 }
 
 bootstrap();
-
-export { startAutoSync, stopAutoSync };

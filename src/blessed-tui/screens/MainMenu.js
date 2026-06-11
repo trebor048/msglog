@@ -1,19 +1,58 @@
 import blessed from 'blessed';
+import { COLORS, STYLES } from '../themes/theme.js';
 
 /**
- * Enhanced Main Menu Screen
+ * Main Menu Screen — entry point of the TUI
+ *
+ * Menu items are mapped to actions by index (not text matching).
+ * Category headers are plain text rendered via style, not Blessed tags.
  */
 export class MainMenu {
-    constructor(screen, ctx, onAction) {
+    constructor(screen, ctx, onBack) {
         this.screen = screen;
         this.ctx = ctx;
-        this.onAction = onAction;
+        this.onBack = onBack;
         this.widgets = {};
         this.updateInterval = null;
+
+        // Index-to-action mapping for the menu list
+        this._actionMap = [];
+        this._rebuildActionMap();
 
         this.create();
         this.setupKeyBindings();
         this.startUpdates();
+    }
+
+    _rebuildActionMap() {
+        // Build action map aligned with buildMenuItems()
+        // Indices: 0=cat, 1=live-monitor, 2=view-channels, 3=manage-channels, 4=sync-all,
+        //          5=toggle-pause, 6=toggle-autosync, 7=blank,
+        //          8=cat, 9=search, 10=stats, 11=export, 12=blank,
+        //          13=cat, 14=database, 15=config, 16=health-check, 17=system-info,
+        //          18=blank, 19=exit
+        this._actionMap = [
+            null,                    // 0  category header
+            'live-monitor',         // 1
+            'view-channels',        // 2
+            'manage-channels',      // 3
+            'sync-all',             // 4
+            'toggle-pause',         // 5
+            'toggle-autosync',      // 6
+            null,                    // 7  blank
+            null,                    // 8  category header
+            'search',               // 9
+            'stats',                // 10
+            'export',               // 11
+            null,                    // 12 blank
+            null,                    // 13 category header
+            'database',             // 14
+            'config',               // 15
+            'health-check',         // 16
+            'system-info',          // 17
+            null,                    // 18 blank
+            'exit',                 // 19
+        ];
     }
 
     create() {
@@ -21,85 +60,65 @@ export class MainMenu {
         this.widgets.main = blessed.box({
             parent: this.screen,
             top: 0, left: 0, width: '100%', height: '100%',
-            style: { bg: 'black', fg: 'white' }
+            style: STYLES.mainBox(),
         });
 
-        // Header — plain text, no tags needed
+        // Header
         this.widgets.header = blessed.box({
             parent: this.widgets.main,
             top: 0, left: 0, width: '100%', height: 1,
-            style: { bg: 'blue', fg: 'white', bold: true },
-            content: ' DISCORD MESSAGE LOGGER'
+            style: STYLES.header(),
+            content: ' DISCORD MESSAGE LOGGER',
         });
 
-        // Status box — plain text, no tags needed
+        // Status box — uses tags for colored output
         this.widgets.status = blessed.box({
             parent: this.widgets.main,
             top: 1, left: 0, width: '100%', height: 4,
             border: { type: 'line' },
-            style: {
-                border: { fg: 'cyan' },
-                fg: 'cyan'
-            }
+            tags: true,
+            style: { border: { fg: COLORS.BORDER }, fg: COLORS.HIGHLIGHT },
         });
 
-        // Menu list — items can have tags for categories
+        // Menu list — items are plain strings, no Blessed tags in content
         this.widgets.menu = blessed.list({
             parent: this.widgets.main,
             top: 5, left: 0, width: '100%',
             height: this.screen.height - 7,
             border: { type: 'line' },
-            tags: true,
+            tags: false,
             label: ' Menu ',
             style: {
-                border: { fg: 'cyan' },
-                selected: { bg: 'blue', fg: 'white', bold: true },
-                item: { fg: 'white' }
+                border: { fg: COLORS.BORDER },
+                selected: { bg: COLORS.FOCUS_BG, fg: COLORS.FOCUS_FG, bold: true },
+                item: { fg: COLORS.PRIMARY_FG },
             },
             mouse: true,
             keys: true,
             vi: true,
-            items: this.buildMenuItems()
+            items: this.buildMenuItems(),
         });
 
-        // Footer — plain text, no tags needed
+        // Footer
         this.widgets.footer = blessed.box({
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
-            style: { fg: 'cyan' },
-            content: ' UP/DOWN Navigate  ENTER Select  ? Help  Q/CTRL+C Exit'
+            style: STYLES.footer(),
+            content: ' UP/DOWN Navigate  ENTER Select  ? Help  ESC/Q Back  Ctrl+C Exit',
         });
 
         this.widgets.menu.focus();
 
         this.widgets.menu.on('select', (item, index) => {
-            const text = item.getText().trim();
-            const actions = {
-                'Live Monitor': 'live-monitor',
-                'View Channels': 'view-channels',
-                'Manage Channels': 'manage-channels',
-                'Sync All Channels': 'sync-all',
-                'Resume Listening': 'toggle-pause',
-                'Pause Listening': 'toggle-pause',
-                'Disable Autosync': 'toggle-autosync',
-                'Enable Autosync': 'toggle-autosync',
-                'Search Messages': 'search',
-                'View Statistics': 'stats',
-                'Export Data': 'export',
-                'Database Manager': 'database',
-                'Configuration': 'config',
-                'Health Check': 'health-check',
-                'System Information': 'system-info',
-                'Exit': 'exit'
-            };
-            const action = actions[text];
-            if (action) this.onAction(action);
+            const action = this._actionMap[index];
+            if (action) this.onBack(action);
         });
     }
 
     buildMenuItems() {
         const items = [
-            '{bold}--- SYNC & MONITOR ---{/bold}',
+            // Category headers use Unicode box-drawing prefix, no Blessed tags
+            '\u2500\u2500 SYNC & MONITOR \u2500\u2500',
             '  Live Monitor',
             '  View Channels',
             '  Manage Channels',
@@ -107,19 +126,21 @@ export class MainMenu {
             this.ctx.isPaused ? '  Resume Listening' : '  Pause Listening',
             this.ctx.autoSyncEnabled ? '  Disable Autosync' : '  Enable Autosync',
             '',
-            '{bold}--- DATA & SEARCH ---{/bold}',
+            '\u2500\u2500 DATA & SEARCH \u2500\u2500',
             '  Search Messages',
             '  View Statistics',
             '  Export Data',
             '',
-            '{bold}--- SYSTEM & CONFIG ---{/bold}',
+            '\u2500\u2500 SYSTEM & CONFIG \u2500\u2500',
             '  Database Manager',
             '  Configuration',
             '  Health Check',
             '  System Information',
             '',
-            '  Exit'
+            '  Exit',
         ];
+
+        this._rebuildActionMap();
         return items;
     }
 
@@ -135,6 +156,7 @@ export class MainMenu {
                 ? `WORKING (${running.length} jobs)`
                 : 'ACTIVE';
 
+        // Use tags for status color coding
         const text =
             ` Status: ${statusLabel}\n` +
             ` Autosync: ${this.ctx.autoSyncEnabled ? 'ON' : 'OFF'}\n` +
@@ -145,7 +167,7 @@ export class MainMenu {
     }
 
     setupKeyBindings() {
-        this.widgets.menu.key(['q'], () => this.onAction('exit'));
+        this.widgets.menu.key(['escape', 'q'], () => this.onBack('exit'));
     }
 
     startUpdates() {

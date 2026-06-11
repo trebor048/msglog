@@ -52,7 +52,7 @@ export class HealthScreen {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: { fg: 'cyan' },
-            content: ' ENTER/Q Back  R Reset  ? Help  Updates every sec'
+            content: ' ESC/Q/ENTER Back  R Reset  ? Help  Updates every sec'
         });
 
         this.widgets.health.focus();
@@ -64,14 +64,15 @@ export class HealthScreen {
             this.ctx.circuitBreaker,
             this.ctx.listeningChannels
         );
+        const runtime = this.ctx.runtimeMetrics || {};
 
         const heapUsed = healthStatus.memoryUsage.heapUsed / 1024 / 1024;
         const heapTotal = healthStatus.memoryUsage.heapTotal / 1024 / 1024;
         const memPercent = Math.floor((heapUsed / heapTotal) * 100);
         const memColor = memPercent > 80 ? 'red' : memPercent > 50 ? 'yellow' : 'green';
 
-        const cbState = healthStatus.circuitBreaker?.state ?? 'UNKNOWN';
-        const cbColor = cbState === 'CLOSED' ? 'green' : cbState === 'OPEN' ? 'red' : 'yellow';
+        const cbState = String(healthStatus.circuitBreaker?.state ?? 'unknown');
+        const cbColor = cbState === 'closed' ? 'green' : cbState === 'open' ? 'red' : 'yellow';
 
         let content = '{cyan-fg}{bold}SYSTEM HEALTH METRICS{/bold}{/cyan-fg}\n';
         content += '{gray-fg}' + '─'.repeat(60) + '{/gray-fg}\n\n';
@@ -86,7 +87,7 @@ export class HealthScreen {
 
         content += '{cyan-fg}{bold}Circuit Breaker{/bold}{/cyan-fg}\n';
         content += `  State:    {${cbColor}-fg}${cbState}{/${cbColor}-fg}\n`;
-        content += `  Failures: {yellow-fg}${healthStatus.circuitBreaker?.failures ?? 0}{/yellow-fg}\n\n`;
+        content += `  Failures: {yellow-fg}${healthStatus.circuitBreaker?.failureCount ?? 0}{/yellow-fg}\n\n`;
 
         content += '{cyan-fg}{bold}Memory{/bold}{/cyan-fg}\n';
         content += `  Heap Used:  {${memColor}-fg}${Math.round(heapUsed)} MB{/${memColor}-fg} / {white-fg}${Math.round(heapTotal)} MB{/white-fg}\n`;
@@ -96,7 +97,12 @@ export class HealthScreen {
         content += `  Active:    {green-fg}${healthStatus.activeChannels}{/green-fg}\n`;
         content += `  Listening: {green-fg}${this.ctx.listeningChannels.size}{/green-fg}\n\n`;
 
-        const overallOk = cbState === 'CLOSED' && memPercent < 80;
+        content += '{cyan-fg}{bold}Event Queue{/bold}{/cyan-fg}\n';
+        content += `  Size:      {yellow-fg}${runtime.eventQueueSize ?? 0}{/yellow-fg} / {white-fg}${runtime.maxEventQueueSize ?? 0}{/white-fg}\n`;
+        content += `  Processed: {green-fg}${(runtime.queuedMessagesProcessed ?? 0).toLocaleString()}{/green-fg}\n`;
+        content += `  Dropped:   {red-fg}${(runtime.queuedMessagesDropped ?? 0).toLocaleString()}{/red-fg}\n\n`;
+
+        const overallOk = cbState === 'closed' && memPercent < 80;
         content += '{cyan-fg}{bold}Overall Status{/bold}{/cyan-fg}\n';
         content += overallOk
             ? '  {green-fg}HEALTHY{/green-fg}\n'
@@ -106,7 +112,7 @@ export class HealthScreen {
     }
 
     setupKeyBindings() {
-        this.widgets.health.key(['enter', 'q'], () => this.onBack());
+        this.widgets.health.key(['escape', 'q', 'enter'], () => this.onBack());
         this.widgets.health.key(['r'], () => {
             this.ctx.circuitBreaker.reset();
             this.updateHealth();
