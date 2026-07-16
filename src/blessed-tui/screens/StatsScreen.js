@@ -60,16 +60,11 @@ export class StatsScreen {
 
     loadStats() {
         try {
-            // Use dbManager abstraction instead of raw SQL
             const channelIds = this.ctx.dbManager?.getChannelIds
                 ? this.ctx.dbManager.getChannelIds()
-                : this.ctx.db.prepare('SELECT DISTINCT channel_id FROM messages ORDER BY channel_id').all();
+                : [];
 
-            const rows = Array.isArray(channelIds) && channelIds.length && typeof channelIds[0] === 'object'
-                ? channelIds  // raw query result (array of {channel_id})
-                : channelIds.map(id => ({ channel_id: id })); // getChannelIds returned string array
-
-            if (!rows.length) {
+            if (!channelIds.length) {
                 this.widgets.table.setContent('\n{yellow-fg}No channel data found in database{/yellow-fg}');
                 this.screen.render();
                 return;
@@ -91,10 +86,12 @@ export class StatsScreen {
                 'SELECT timestamp FROM messages WHERE channel_id = ? AND deleted = 0 ORDER BY timestamp DESC LIMIT 1'
             );
 
+            const syncStmt = this.ctx.db.prepare('SELECT * FROM channel_sync_state WHERE channel_id = ?');
+
             let content = '{cyan-fg}{bold}CHANNEL STATISTICS{/bold}{/cyan-fg}\n';
             content += '{gray-fg}' + '─'.repeat(80) + '{/gray-fg}\n\n';
 
-            rows.forEach(({ channel_id: id }) => {
+            channelIds.forEach(id => {
                 const ch = this.ctx.client.channels.cache.get(id);
                 const guild = ch?.guild?.name ? ` [${ch.guild.name}]` : '';
                 const rawName = ch ? `#${ch.name}${guild}` : `Unknown (${id})`;
@@ -102,13 +99,13 @@ export class StatsScreen {
                 const listening = this.ctx.listeningChannels.has(id);
 
                 const stat = statsStmt.get(id);
+                if (!stat) return;
                 const last = lastStmt.get(id);
                 const lastTime = last?.timestamp ? moment(last.timestamp).fromNow() : 'Never';
 
-                // Sync state cursor info
                 let syncInfo = '';
                 try {
-                    const ss = this.ctx.db.prepare('SELECT * FROM channel_sync_state WHERE channel_id = ?').get(id);
+                    const ss = syncStmt.get(id);
                     if (ss) {
                         const complete = ss.is_complete ? ' {green-fg}[COMPLETE]{/green-fg}' : '';
                         const synced = ss.last_synced_at ? ` synced ${moment(ss.last_synced_at).fromNow()}` : '';
@@ -131,7 +128,7 @@ export class StatsScreen {
             });
 
             content += '{gray-fg}' + '─'.repeat(80) + '{/gray-fg}\n';
-            content += `{cyan-fg}Total channels: {yellow-fg}${rows.length}{/yellow-fg}{/cyan-fg}`;
+            content += `{cyan-fg}Total channels: {yellow-fg}${channelIds.length}{/yellow-fg}{/cyan-fg}`;
 
             this.widgets.table.setContent(content);
         } catch (err) {

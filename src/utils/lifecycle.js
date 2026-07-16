@@ -104,7 +104,7 @@ export function setupEventHandlers(client, listeningChannels, messageStore, isPa
             try { await newMsg.fetch(); } catch { return; }
         }
         if (newMsg.author?.bot || !newMsg.channel?.id || !listeningChannels.has(newMsg.channel.id)) return;
-        if (newMsg.content === undefined) return;
+        if (newMsg.content === undefined || newMsg.content === null) return;
         try {
             messageStore.updateMessageContent(newMsg.id, newMsg.content, newMsg.editedAt);
         } catch (err) {

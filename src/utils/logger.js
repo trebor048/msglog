@@ -25,7 +25,15 @@ export class Logger {
         }
 
         const timestamp = now.toISOString();
-        const logLine = `[${timestamp}] [${level}] ${message}${data ? ' ' + JSON.stringify(data) : ''}\n`;
+        let dataStr = '';
+        if (data !== null && data !== undefined) {
+            try {
+                dataStr = ' ' + JSON.stringify(data);
+            } catch {
+                dataStr = ' [unserializable data]';
+            }
+        }
+        const logLine = `[${timestamp}] [${level}] ${message}${dataStr}\n`;
         fs.appendFile(this.logFile, logLine)
             .then(() => { this._appendFailed = false; })
             .catch((err) => {

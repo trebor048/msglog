@@ -44,9 +44,14 @@ function redirectConsoleToFile() {
     ];
 
     const write = (level, args) => {
-        let line = `[${new Date().toISOString()}] [${level}] ${args.map(a =>
-            typeof a === 'string' ? a : JSON.stringify(a)
-        ).join(' ')}\n`;
+        let line;
+        try {
+            line = `[${new Date().toISOString()}] [${level}] ${args.map(a =>
+                typeof a === 'string' ? a : JSON.stringify(a)
+            ).join(' ')}\n`;
+        } catch {
+            line = `[${new Date().toISOString()}] [${level}] [unserializable log args]\n`;
+        }
 
         // Redact any line matching sensitive patterns
         if (SENSITIVE_PATTERNS.some(p => p.test(line))) {
@@ -65,7 +70,11 @@ function redirectConsoleToFile() {
             // keep best-effort logging
         }
 
-        stream.write(line);
+        try {
+            stream.write(line);
+        } catch {
+            // ignore write errors — best-effort logging
+        }
     };
 
     const orig = {

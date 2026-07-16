@@ -128,6 +128,8 @@ export class SyncEngine {
             let lastMessageId = null;
 
             if (direction === 'resume') {
+                // Resume: fetch messages NEWER than our last known newest.
+                // Uses after= in the fetch loop.
                 if (syncState?.newest_id) {
                     lastMessageId = syncState.newest_id;
                     const when = syncState.last_synced_at
@@ -135,35 +137,81 @@ export class SyncEngine {
                         : 'unknown';
                     log(`📍 Resuming from stored cursor (last synced: ${when})`);
                 } else {
-                    // Fall back to newest message in DB
                     const row = this.messageStore.getMostRecentMessage(channel.id);
                     if (row) {
                         lastMessageId = row.id;
                         log(`📍 Resuming from DB newest message (${new Date(row.timestamp).toLocaleString()})`);
                     } else {
-                        direction = 'forward';
-                        log('⚠️ No prior sync state — switching to forward sync');
+                        try {
+                            const seed = await apiFetch({ limit: 1 });
+                            lastMessageId = seed.first()?.id ?? null;
+                            log('📍 No prior sync state — starting resume from channel newest message');
+                        } catch (err) {
+                            log(`⚠️ Could not fetch seed message: ${err.message}`);
+                        }
+                    }
+                }
+            } else if (direction === 'backward') {
+                // Backward: start from the channel's NEWEST message and page toward oldest.
+                // Uses before= to walk backward through history.
+                try {
+                    const seed = await apiFetch({ limit: 1 });
+                    lastMessageId = seed.first()?.id ?? null;
+                    if (lastMessageId) log(`📍 Starting backward sync from channel newest message`);
+                    else log('⚠️ Channel appears empty');
+                } catch (err) {
+                    log(`⚠️ Could not fetch seed message: ${err.message}`);
+                }
+            } else if (direction === 'forward') {
+                // Forward: start from the OLDEST message already in DB (or channel start
+                // if nothing is stored yet) and page toward the newest.
+                // Uses before= but starts from the oldest stored cursor.
+                const oldestRow = this.messageStore.getOldestMessage(channel.id);
+                if (oldestRow?.id) {
+                    lastMessageId = oldestRow.id;
+                    log(`📍 Starting forward sync from oldest DB message (${new Date(oldestRow.timestamp).toLocaleString()})`);
+                } else if (syncState?.oldest_id) {
+                    lastMessageId = syncState.oldest_id;
+                    log(`📍 Starting forward sync from stored oldest cursor`);
+                } else {
+                    // No data at all — fetch the oldest message in the channel
+                    // by fetching with no cursor (Discord gives newest), then we'll
+                    // naturally walk all the way back anyway.
+                    // Better: fetch the actual oldest by using after= on the very first
+                    // known snowflake (Discord epoch: 2015-01-01).
+                    const DISCORD_EPOCH_SNOWFLAKE = '0';
+                    try {
+                        const seed = await apiFetch({ limit: 1, after: DISCORD_EPOCH_SNOWFLAKE });
+                        lastMessageId = seed.first()?.id ?? null;
+                        if (lastMessageId) {
+                            log(`📍 Starting forward sync from channel's oldest message`);
+                        } else {
+                            log('⚠️ Channel appears empty');
+                        }
+                    } catch (err) {
+                        log(`⚠️ Could not fetch oldest message: ${err.message}`);
                     }
                 }
             }
 
-            if (direction === 'forward' || direction === 'backward') {
-                try {
-                    const seed = await apiFetch({ limit: 1 });
-                    lastMessageId = seed.first()?.id ?? null;
-                    if (lastMessageId) log(`📍 Starting ${direction} sync from newest message`);
-                } catch (err) {
-                    log(`⚠️ Could not fetch seed message: ${err.message}`);
-                }
-            }
-
             // ── Date range ───────────────────────────────────────────────────
-            const startMoment = direction === 'custom'
-                ? (startDate === 'start' ? moment('2015-01-01') : moment(startDate))
-                : null;
-            const endMoment = direction === 'custom'
-                ? (endDate === 'now' ? moment() : moment(endDate))
-                : null;
+            let startMoment = null;
+            let endMoment = null;
+            if (direction === 'custom') {
+                if (startDate === 'start') {
+                    // Use channel creation date instead of hardcoded 2015
+                    if (channel.createdTimestamp) {
+                        startMoment = moment(channel.createdTimestamp).startOf('day');
+                        log(`📍 Using channel creation date as start: ${startMoment.format('YYYY-MM-DD')}`);
+                    } else {
+                        startMoment = moment('2015-05-13');
+                        log('📍 Channel creation date unavailable — using Discord launch date (2015-05-13)');
+                    }
+                } else {
+                    startMoment = moment(startDate);
+                }
+                endMoment = endDate === 'now' ? moment() : moment(endDate);
+            }
 
             if (direction === 'custom' && (!startMoment?.isValid() || !endMoment?.isValid())) {
                 log('❌ Invalid date format — use YYYY-MM-DD or "start"/"now"');
@@ -227,11 +275,18 @@ export class SyncEngine {
                 await this.rateLimiter.wait(channel.id);
 
                 // Build fetch options
+                // Discord always returns messages newest-first within a batch.
+                //
+                // Direction semantics:
+                //   'resume'   → after=  : fetch messages NEWER than cursor (catches up to present)
+                //   'backward' → before= : start from newest, walk toward oldest
+                //   'forward'  → after=  : start from oldest stored, walk toward newest
+                //   'custom'   → before= : start from newest, walk toward oldest, filtered by date
                 const fetchOpts = { limit: 100 };
-                if (direction === 'resume' && lastMessageId) {
-                    fetchOpts.after = lastMessageId;   // page forward from newest stored
+                if (direction === 'resume' || direction === 'forward') {
+                    if (lastMessageId) fetchOpts.after = lastMessageId;
                 } else if (lastMessageId) {
-                    fetchOpts.before = lastMessageId;  // page backward from cursor
+                    fetchOpts.before = lastMessageId;
                 }
 
                 // Fetch with retry (no circuit breaker)
@@ -249,20 +304,28 @@ export class SyncEngine {
 
                 let batch = [...messages.values()];
 
-                // Date range filter + stop condition
+                // Date range filter + stop condition for custom syncs.
+                // Discord returns newest-first; messages.first() = newest in batch.
+                // Stop only when the NEWEST message in the batch is already before
+                // startMoment — all remaining history is out of range.
                 if (direction === 'custom') {
-                    batch = batch.filter(m => moment(m.createdAt).isBetween(startMoment, endMoment, null, '[]'));
-                    const oldest = messages.last()?.createdAt;
-                    if (oldest && moment(oldest).isBefore(startMoment)) {
+                    const batchNewest = messages.first()?.createdAt;
+                    if (batchNewest && moment(batchNewest).isBefore(startMoment)) {
                         log('📍 Reached start of date range');
                         break;
                     }
+                    batch = batch.filter(m => moment(m.createdAt).isBetween(startMoment, endMoment, null, '[]'));
                 }
 
-                // Advance cursor BEFORE dedup so we always make progress
-                lastMessageId = direction === 'resume'
-                    ? messages.first().id   // after= returns newest-first
-                    : messages.last().id;   // before= returns newest-first, last = oldest
+                // Advance cursor based on direction:
+                //   resume/forward (after=): Discord returns oldest-first when using after=,
+                //     so .last() is the newest message — use that as next cursor.
+                //   backward/custom (before=): Discord returns newest-first when using before=,
+                //     so .last() is the oldest message — use that as next cursor.
+                //
+                // Note: discord.js-selfbot-v13 Collection with after= returns ascending order
+                // (oldest first), while before= returns descending order (newest first).
+                lastMessageId = messages.last().id;
 
                 if (!batch.length) continue;
 
@@ -272,8 +335,8 @@ export class SyncEngine {
                 const newMsgs  = batch.filter(m => !existing.has(m.id));
 
                 if (newMsgs.length === 0) {
-                    // All already stored — on resume this means we've caught up
-                    if (direction === 'resume') {
+                    // All already stored — on resume/forward this means we've caught up
+                    if (direction === 'resume' || direction === 'forward') {
                         log('✅ Caught up — all messages already in DB');
                         break;
                     }
@@ -284,8 +347,12 @@ export class SyncEngine {
                     log(`⏭️ ${batch.length - newMsgs.length} already in DB, storing ${newMsgs.length} new`);
                 }
 
-                // Store — forward sync reverses so oldest-first insert order
-                const toStore = direction === 'forward' ? [...newMsgs].reverse() : newMsgs;
+                // Store in chronological order (oldest first) for all directions.
+                // after= (resume/forward) returns ascending — already oldest-first.
+                // before= (backward/custom) returns descending — needs reverse.
+                const toStore = (direction === 'backward' || direction === 'custom')
+                    ? [...newMsgs].reverse()
+                    : newMsgs;
                 await this.messageStore.storeMessagesBatch(
                     toStore, channel, withRetry,
                     this.downloadAttachmentFn, this.processEmbedsFn, isShutdownRequested
@@ -299,11 +366,15 @@ export class SyncEngine {
                 lastHeartbeat = Date.now();
 
                 // Accumulate cursor state in memory
-                const oldestInBatch = toStore[toStore.length - 1];
-                if (direction !== 'resume') {
-                    pendingFlush.oldest_id = oldestInBatch.id;
+                // toStore is always oldest-first, so toStore[0] = oldest, toStore[last] = newest
+                const oldestInBatch = toStore[0];
+                const newestInBatch = toStore[toStore.length - 1];
+                if (direction === 'resume' || direction === 'forward') {
+                    pendingFlush.newest_id = newestInBatch?.id ?? null;
+                    if (!pendingFlush.oldest_id) pendingFlush.oldest_id = oldestInBatch?.id ?? null;
                 } else {
-                    pendingFlush.newest_id = lastMessageId;
+                    pendingFlush.oldest_id = oldestInBatch?.id ?? null;
+                    if (!pendingFlush.newest_id) pendingFlush.newest_id = newestInBatch?.id ?? null;
                 }
                 pendingFlush.total += newMsgs.length;
 

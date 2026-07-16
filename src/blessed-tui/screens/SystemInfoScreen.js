@@ -86,10 +86,15 @@ export class SystemInfoScreen {
         }
 
         if (stats.lastError) {
-            const safeMsg = Validator.sanitizeErrorMessage(stats.lastError);
+            const rawMsg = typeof stats.lastError === 'object'
+                ? (stats.lastError.message || String(stats.lastError))
+                : String(stats.lastError);
+            const safeMsg = Validator.sanitizeBlessedTags(rawMsg.substring(0, 200));
             c += `\n{red-fg}{bold}Last Error{/bold}{/red-fg}\n`;
             c += `  {red-fg}${safeMsg}{/red-fg}\n`;
-            c += `  {gray-fg}${stats.lastError.timestamp}{/gray-fg}\n`;
+            if (typeof stats.lastError === 'object' && stats.lastError.timestamp) {
+                c += `  {gray-fg}${stats.lastError.timestamp}{/gray-fg}\n`;
+            }
         }
 
         this.widgets.content.setContent(c);

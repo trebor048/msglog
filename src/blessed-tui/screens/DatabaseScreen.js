@@ -206,8 +206,8 @@ export class DatabaseScreen {
             const res = fn();
             spinner.stop(true);
             
-            const ok = String(res).toLowerCase().includes('fail') || String(res).toLowerCase().includes('failed');
-            this.widgets.output.setContent(`\n{${ok ? 'red' : 'green'}-fg}${res}{/${ok ? 'red' : 'green'}-fg}`);
+            const hasFail = String(res).toLowerCase().includes('fail') || String(res).toLowerCase().includes('failed');
+            this.widgets.output.setContent(`\n{${hasFail ? 'red' : 'green'}-fg}${res}{/${hasFail ? 'red' : 'green'}-fg}`);
         } catch (err) {
             spinner.stop(false);
             this.widgets.output.setContent(`\n{red-fg}Action failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);

@@ -196,13 +196,13 @@ export class ChannelScreen {
 
         items.push(isListening ? 'Stop Listening' : 'Start Listening');
         actions.push('LISTEN');
-        items.push('Fetch All (Oldest to Newest)');
-        actions.push('FULL_FORWARD');
-        items.push('Fetch All (Newest to Oldest)');
+        items.push('Fetch All (Newest → Oldest)');
         actions.push('FULL_BACKWARD');
+        items.push('Fetch All (Oldest → Newest)');
+        actions.push('FULL_FORWARD');
         items.push('Custom Date Range');
         actions.push('CUSTOM_DATES');
-        items.push('Resume from Last');
+        items.push('Resume (fetch new messages since last sync)');
         actions.push('RESUME');
         items.push('\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500');
         actions.push('SEP');
@@ -317,15 +317,18 @@ export class ChannelScreen {
             channel, direction, null, null, job.id,
             this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
         );
-        // showMessage uses a box with tags:true for colored content
+        const desc = direction === 'forward'
+            ? 'Oldest → Newest'
+            : direction === 'backward'
+            ? 'Newest → Oldest'
+            : 'Resuming from last sync';
         this.showMessage(
-            `{green-fg}Job #${job.id} started!{/green-fg}\n Fetching #${Validator.sanitizeBlessedTags(channel.name)} (${direction})`,
+            `{green-fg}Job #${job.id} started!{/green-fg}\n ${Validator.sanitizeBlessedTags(desc)} on #${Validator.sanitizeBlessedTags(channel.name)}`,
             () => this.onBack()
         );
     }
 
     promptCustomDates(channel) {
-        const defaultValue = 'start';
         const input = blessed.textbox({
             parent: this.widgets.main,
             top: 'center', left: 'center',
@@ -340,7 +343,7 @@ export class ChannelScreen {
 
         this.screen.render();
 
-        input.setValue(defaultValue);
+        input.setValue('start');
         input.focus();
 
         input.key('enter', () => {
@@ -348,15 +351,44 @@ export class ChannelScreen {
             input.destroy();
             this.screen.render();
             if (!startDate) { this.showFetchOptions(channel); return; }
-            const job = this.ctx.jobManager.createJob(channel, 'custom', startDate.trim(), 'now');
-            this.ctx.syncEngine.syncChannelMessages(
-                channel, 'custom', startDate.trim(), 'now', job.id,
-                this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
-            );
-            this.showMessage(
-                `{green-fg}Custom job #${job.id} started!{/green-fg}`,
-                () => this.onBack()
-            );
+
+            const input2 = blessed.textbox({
+                parent: this.widgets.main,
+                top: 'center', left: 'center',
+                width: '60%', height: 3,
+                border: { type: 'line' },
+                style: { border: { fg: 'yellow' }, bg: 'black', fg: 'white' },
+                label: ' End date (YYYY-MM-DD or "now"): ',
+                inputOnFocus: true,
+                keys: true,
+                mouse: true
+            });
+
+            this.screen.render();
+            input2.setValue('now');
+            input2.focus();
+
+            input2.key('enter', () => {
+                const endDate = input2.getValue();
+                input2.destroy();
+                this.screen.render();
+                if (!endDate) { this.showFetchOptions(channel); return; }
+                const job = this.ctx.jobManager.createJob(channel, 'custom', startDate.trim(), endDate.trim());
+                this.ctx.syncEngine.syncChannelMessages(
+                    channel, 'custom', startDate.trim(), endDate.trim(), job.id,
+                    this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
+                );
+                this.showMessage(
+                    `{green-fg}Custom job #${job.id} started!{/green-fg}\n From ${Validator.sanitizeBlessedTags(startDate.trim())} to ${Validator.sanitizeBlessedTags(endDate.trim())}`,
+                    () => this.onBack()
+                );
+            });
+
+            input2.key('escape', () => {
+                input2.destroy();
+                this.screen.render();
+                this.showFetchOptions(channel);
+            });
         });
 
         input.key('escape', () => {

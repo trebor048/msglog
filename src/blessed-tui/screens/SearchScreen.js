@@ -1,5 +1,8 @@
 import blessed from 'blessed';
+import moment from 'moment';
 import { Validator } from '../../utils/utils.js';
+
+const DISCORD_LAUNCH = '2015-05-13';
 
 /**
  * Search Messages Screen
@@ -174,6 +177,20 @@ export class SearchScreen {
 
                 if (!Validator.isValidDate(startDate) || !Validator.isValidDate(endDate)) {
                     this.widgets.results.setContent('\n{red-fg}Invalid date format. Use YYYY-MM-DD{/red-fg}');
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
+                if (moment(startDate).isBefore(DISCORD_LAUNCH)) {
+                    this.widgets.results.setContent(`\n{red-fg}Start date cannot be before Discord's launch (${DISCORD_LAUNCH}){/red-fg}`);
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
+                if (moment(endDate).isAfter(moment())) {
+                    this.widgets.results.setContent('\n{red-fg}End date cannot be in the future{/red-fg}');
                     this.widgets.menu.focus();
                     this.screen.render();
                     return;

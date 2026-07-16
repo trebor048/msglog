@@ -66,7 +66,8 @@ export class MessageStore {
         if (this.referenceCache.has(refId)) return this.referenceCache.get(refId);
 
         try {
-            const ref = await withRetry(() => channel.messages.fetch(refId, { cache: true }));
+            const fetchFn = () => channel.messages.fetch(refId, { cache: true });
+            const ref = await (typeof withRetry === 'function' ? withRetry(fetchFn) : fetchFn());
             const content = ref.content || '[Message content not available]';
             this.referenceCache.set(refId, content);
             return content;

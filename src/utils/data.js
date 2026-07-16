@@ -13,7 +13,8 @@ function normalizeStartDateInput(value) {
     if (typeof value !== 'string') return value;
     const trimmed = value.trim();
     if (!DATE_ONLY_PATTERN.test(trimmed)) return value;
-    const dt = new Date(`${trimmed}T00:00:00.000Z`);
+    // Parse as local midnight so users in any timezone get the day they intended
+    const dt = new Date(`${trimmed}T00:00:00`);
     return Number.isNaN(dt.getTime()) ? value : dt.toISOString();
 }
 
@@ -21,7 +22,8 @@ function normalizeEndDateInput(value) {
     if (typeof value !== 'string') return value;
     const trimmed = value.trim();
     if (!DATE_ONLY_PATTERN.test(trimmed)) return value;
-    const dt = new Date(`${trimmed}T23:59:59.999Z`);
+    // Parse as local end-of-day so the full day is included
+    const dt = new Date(`${trimmed}T23:59:59.999`);
     return Number.isNaN(dt.getTime()) ? value : dt.toISOString();
 }
 
@@ -219,56 +221,56 @@ export class MessageSearch {
     }
 
     getStats(channelId = null) {
-        let sql = 'SELECT ';
-        sql += 'COUNT(*) as total, ';
-        sql += 'COUNT(CASE WHEN is_bot = 1 THEN 1 END) as bot_messages, ';
-        sql += 'COUNT(CASE WHEN deleted = 1 THEN 1 END) as deleted, ';
-        sql += 'COUNT(CASE WHEN edited_at IS NOT NULL THEN 1 END) as edited, ';
-        sql += `COUNT(CASE WHEN ${REACTIONS_COUNT_EXPR} > 0 THEN 1 END) as with_reactions, `;
-        sql += `COUNT(CASE WHEN ${ATTACHMENTS_COUNT_EXPR} > 0 THEN 1 END) as with_attachments, `;
-        sql += 'COUNT(DISTINCT author_id) as unique_authors, ';
-        sql += 'COUNT(DISTINCT channel_id) as unique_channels, ';
-        sql += 'MIN(timestamp) as oldest_message, ';
-        sql += 'MAX(timestamp) as newest_message ';
-        sql += 'FROM messages';
+        const baseSql = 'SELECT '
+            + 'COUNT(*) as total, '
+            + 'COUNT(CASE WHEN is_bot = 1 THEN 1 END) as bot_messages, '
+            + 'COUNT(CASE WHEN deleted = 1 THEN 1 END) as deleted, '
+            + 'COUNT(CASE WHEN edited_at IS NOT NULL THEN 1 END) as edited, '
+            + `COUNT(CASE WHEN ${REACTIONS_COUNT_EXPR} > 0 THEN 1 END) as with_reactions, `
+            + `COUNT(CASE WHEN ${ATTACHMENTS_COUNT_EXPR} > 0 THEN 1 END) as with_attachments, `
+            + 'COUNT(DISTINCT author_id) as unique_authors, '
+            + 'COUNT(DISTINCT channel_id) as unique_channels, '
+            + 'MIN(timestamp) as oldest_message, '
+            + 'MAX(timestamp) as newest_message '
+            + 'FROM messages';
 
         if (channelId) {
-            sql += ' WHERE channel_id = ?';
             if (!this._statsChannelStmt) {
-                this._statsChannelStmt = this.db.prepare(sql);
+                this._statsChannelStmt = this.db.prepare(baseSql + ' WHERE channel_id = ?');
             }
             return this._statsChannelStmt.get(channelId);
         }
 
         if (!this._statsStmt) {
-            this._statsStmt = this.db.prepare(sql);
+            this._statsStmt = this.db.prepare(baseSql);
         }
         return this._statsStmt.get();
     }
 
     getTopAuthors(limit = 10, channelId = null) {
-        let sql = `
-            SELECT author_tag, author_id, COUNT(*) as message_count
-            FROM messages
-            WHERE deleted = 0
-        `;
-
         if (channelId) {
-            sql += ` AND channel_id = ?`;
-            sql += ` GROUP BY author_id, author_tag
-                     ORDER BY message_count DESC
-                     LIMIT ?`;
             if (!this._topAuthorsChannelStmt) {
-                this._topAuthorsChannelStmt = this.db.prepare(sql);
+                this._topAuthorsChannelStmt = this.db.prepare(`
+                    SELECT author_tag, author_id, COUNT(*) as message_count
+                    FROM messages
+                    WHERE deleted = 0 AND channel_id = ?
+                    GROUP BY author_id, author_tag
+                    ORDER BY message_count DESC
+                    LIMIT ?
+                `);
             }
             return this._topAuthorsChannelStmt.all(channelId, limit);
         }
 
-        sql += ` GROUP BY author_id, author_tag
-                 ORDER BY message_count DESC
-                 LIMIT ?`;
         if (!this._topAuthorsStmt) {
-            this._topAuthorsStmt = this.db.prepare(sql);
+            this._topAuthorsStmt = this.db.prepare(`
+                SELECT author_tag, author_id, COUNT(*) as message_count
+                FROM messages
+                WHERE deleted = 0
+                GROUP BY author_id, author_tag
+                ORDER BY message_count DESC
+                LIMIT ?
+            `);
         }
         return this._topAuthorsStmt.all(limit);
     }
@@ -505,7 +507,7 @@ export class MessageExporter {
     }
 
     _buildFilteredQuery(filters) {
-        let sql = 'SELECT * FROM messages WHERE 1=1';
+        let sql = 'SELECT * FROM messages WHERE deleted = 0';
 
         if (filters.query) sql += ' AND content LIKE ?';
         if (filters.authorId) sql += ' AND author_id = ?';
@@ -532,8 +534,8 @@ export class MessageExporter {
         if (filters.authorId) params.push(filters.authorId);
         if (filters.authorQuery) params.push(filters.authorQuery, `%${filters.authorQuery}%`);
         if (filters.channelId) params.push(filters.channelId);
-        if (normalizedStartDate) params.push(normalizedStartDate);
-        if (normalizedEndDate) params.push(normalizedEndDate);
+        if (normalizedStartDate && filters.startDate) params.push(normalizedStartDate);
+        if (normalizedEndDate && filters.endDate) params.push(normalizedEndDate);
         return params;
     }
 
@@ -719,7 +721,7 @@ export class DatabaseManager {
     }
 
     getChannelStats(channelId = null) {
-        let sql = `
+        const baseSql = `
             SELECT
                 channel_id,
                 COUNT(*) as message_count,
@@ -733,14 +735,14 @@ export class DatabaseManager {
         `;
 
         if (channelId) {
-            sql += ` WHERE channel_id = ?`;
+            const sql = baseSql + ` WHERE channel_id = ?`;
             if (!this._channelStatsStmt) {
                 this._channelStatsStmt = this.db.prepare(sql);
             }
             return this._channelStatsStmt.get(channelId);
         }
 
-        sql += ` GROUP BY channel_id ORDER BY message_count DESC`;
+        const sql = baseSql + ` GROUP BY channel_id ORDER BY message_count DESC`;
         if (!this._channelStatsAllStmt) {
             this._channelStatsAllStmt = this.db.prepare(sql);
         }
