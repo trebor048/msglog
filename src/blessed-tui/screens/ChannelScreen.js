@@ -172,16 +172,40 @@ export class ChannelScreen {
     handleGuildAction(guild, channels, action) {
         if (action === 'LISTEN_ALL') {
             this.promptPersistence((persist) => {
+                const before = new Set(this.ctx.listeningChannels);
                 channels.forEach(c => this.ctx.listeningChannels.add(c.id));
-                if (persist && this.ctx.dbManager) {
-                    this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+                const saved = !persist || !this.ctx.dbManager
+                    ? true
+                    : this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+                if (!saved) {
+                    // Persist failed — revert in place (never reassign: the
+                    // live event handlers hold this exact Set by reference)
+                    // so the UI doesn't claim channels are listened-to when
+                    // a restart would drop them.
+                    channels.forEach(c => { if (!before.has(c.id)) this.ctx.listeningChannels.delete(c.id); });
+                    this.showMessage(
+                        '{red-fg}Failed to save — listen state unchanged{/red-fg}',
+                        () => this.showChannelList(guild)
+                    );
+                    return;
                 }
                 this.showChannelList(guild);
             });
         } else if (action === 'STOP_ALL') {
+            const before = new Set(this.ctx.listeningChannels);
             channels.forEach(c => this.ctx.listeningChannels.delete(c.id));
-            if (this.ctx.dbManager) {
-                this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+            const saved = !this.ctx.dbManager
+                ? true
+                : this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+            if (!saved) {
+                // Persist failed — restore in place (same reference the live
+                // event handlers hold) so the UI doesn't lie about the state.
+                before.forEach(id => this.ctx.listeningChannels.add(id));
+                this.showMessage(
+                    '{red-fg}Failed to save — listen state unchanged{/red-fg}',
+                    () => this.showChannelList(guild)
+                );
+                return;
             }
             this.showChannelList(guild);
         }
@@ -261,15 +285,36 @@ export class ChannelScreen {
             case 'LISTEN':
                 if (this.ctx.listeningChannels.has(channel.id)) {
                     this.ctx.listeningChannels.delete(channel.id);
-                    if (this.ctx.dbManager) this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
-                    this.showFetchOptions(channel);
+                    const saved = !this.ctx.dbManager
+                        ? true
+                        : this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+                    if (!saved) {
+                        // Persist failed — restore in place (live handlers hold
+                        // this Set by reference) instead of showing LISTENING
+                        // for a change a restart would drop.
+                        this.ctx.listeningChannels.add(channel.id);
+                        this.showMessage(
+                            '{red-fg}Failed to save — still listening{/red-fg}',
+                            () => this.showFetchOptions(channel)
+                        );
+                    } else {
+                        this.showFetchOptions(channel);
+                    }
                 } else {
                     this.promptPersistence((persist) => {
                         this.ctx.listeningChannels.add(channel.id);
-                        if (persist && this.ctx.dbManager) {
-                            this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+                        const saved = !persist || !this.ctx.dbManager
+                            ? true
+                            : this.ctx.dbManager.saveListeningChannels(this.ctx.listeningChannels);
+                        if (!saved) {
+                            this.ctx.listeningChannels.delete(channel.id);
+                            this.showMessage(
+                                '{red-fg}Failed to save — not listening{/red-fg}',
+                                () => this.showFetchOptions(channel)
+                            );
+                        } else {
+                            this.showFetchOptions(channel);
                         }
-                        this.showFetchOptions(channel);
                     });
                 }
                 break;

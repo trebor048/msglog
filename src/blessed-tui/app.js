@@ -275,11 +275,22 @@ export class BlessedTUIApp {
     async handleToggleAutosync() {
         if (this.ctx.autoSyncEnabled) {
             stopAutoSync(this.ctx);
-            this.ctx.dbManager?.saveAutoSync(false, this.ctx.autoSyncIntervalMs);
+            const saved = this.ctx.dbManager?.saveAutoSync(false, this.ctx.autoSyncIntervalMs) ?? true;
+            if (!saved) {
+                // Can't revert by re-enabling (that would refire sync bursts),
+                // so at least warn loudly — the live state is authoritative.
+                this.ctx.logger?.warn?.('Autosync disabled for this session, but the preference failed to persist');
+            }
         } else {
             if (this.ctx.listeningChannels.size) {
                 startAutoSync(this.ctx);
-                this.ctx.dbManager?.saveAutoSync(true, this.ctx.autoSyncIntervalMs);
+                const saved = this.ctx.dbManager?.saveAutoSync(true, this.ctx.autoSyncIntervalMs) ?? true;
+                if (!saved) {
+                    // Revert (cheap: just clears the interval) so live state
+                    // and persisted preference can't silently diverge.
+                    stopAutoSync(this.ctx);
+                    this.ctx.logger?.warn?.('Autosync enable failed to persist — autosync left disabled');
+                }
             } else {
                 // No channels to sync — surface feedback instead of silently no-op
                 this.ctx.logger?.warn?.('Autosync toggle ignored: no listening channels');

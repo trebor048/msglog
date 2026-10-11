@@ -69,6 +69,7 @@ function clamp(value, min, max, fallback) {
 }
 
 function normalizeConfig(config) {
+
     const normalized = { ...config };
     if (!normalized.databaseFile || typeof normalized.databaseFile !== 'string') {
         normalized.databaseFile = defaultConfig.databaseFile;
@@ -114,12 +115,28 @@ export async function loadConfig() {
         Object.assign(config, normalizeConfig(config));
     } catch (err) {
         if (err.code === 'ENOENT') {
-            await fs.writeFile('./config.json', JSON.stringify(config, null, 2));
+            await writeConfigAtomic(config);
         } else {
             console.warn(chalk.yellow('⚠️ Config load error, using defaults:', err.message));
         }
     }
     return config;
+}
+
+// Atomic config write: a crash mid-write must never leave a truncated
+// config.json behind (the next loadConfig would JSON.parse-fail and silently
+// fall back to defaults, discarding every user setting). Write to a temp
+// file and rename over the target — rename is atomic on POSIX and Windows.
+async function writeConfigAtomic(config) {
+    const data = JSON.stringify(config, null, 2);
+    const tmpPath = `./config.json.tmp-${process.pid}`;
+    try {
+        await fs.writeFile(tmpPath, data);
+        await fs.rename(tmpPath, './config.json');
+    } catch (err) {
+        try { await fs.unlink(tmpPath); } catch {}
+        throw err;
+    }
 }
 
 export async function saveConfig(config) {
@@ -128,7 +145,7 @@ export async function saveConfig(config) {
         ...config
     });
     normalized.downloadAttachments = Boolean(normalized.downloadAttachments);
-    return fs.writeFile('./config.json', JSON.stringify(normalized, null, 2));
+    return writeConfigAtomic(normalized);
 }
 
 // ─── Database ─────────────────────────────────────────────────────────────────
