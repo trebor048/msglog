@@ -11,6 +11,8 @@ export class DatabaseScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.dbManager = ctx.dbManager;
+        this._destroyed = false;
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -90,6 +92,13 @@ export class DatabaseScreen {
 
         this.widgets.menu.focus();
         this.widgets.menu.on('select', (item, index) => this.handleMenuSelect(index));
+
+        this._resizeHandler = () => {
+            this.widgets.menu.height = this.screen.height - 3;
+            this.widgets.output.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     handleMenuSelect(index) {
@@ -161,9 +170,10 @@ export class DatabaseScreen {
             let c = '\n{cyan-fg}{bold}Table Structures{/bold}{/cyan-fg}\n';
             c += '{gray-fg}' + '─'.repeat(40) + '{/gray-fg}\n\n';
             for (const [name, table] of Object.entries(info)) {
-                c += ` {bold}${name}{/bold} {gray-fg}(${table.rowCount} rows){/gray-fg}\n`;
+                const safeName = Validator.sanitizeBlessedTags(name);
+                c += ` {bold}${safeName}{/bold} {gray-fg}(${table.rowCount} rows){/gray-fg}\n`;
                 table.columns.forEach(col => {
-                    c += `  {gray-fg}•{/gray-fg} ${col.name} {gray-fg}(${col.type}){/gray-fg}\n`;
+                    c += `  {gray-fg}•{/gray-fg} ${Validator.sanitizeBlessedTags(col.name)} {gray-fg}(${Validator.sanitizeBlessedTags(col.type)}){/gray-fg}\n`;
                 });
                 c += '\n';
             }
@@ -184,7 +194,7 @@ export class DatabaseScreen {
                 c += '{gray-fg}No custom indexes found{/gray-fg}';
             } else {
                 indexes.forEach(idx => {
-                    c += ` {gray-fg}•{/gray-fg} {bold}${idx.name}{/bold} {gray-fg}on ${idx.tbl_name}{/gray-fg}\n`;
+                    c += ` {gray-fg}•{/gray-fg} {bold}${Validator.sanitizeBlessedTags(idx.name)}{/bold} {gray-fg}on ${Validator.sanitizeBlessedTags(idx.tbl_name)}{/gray-fg}\n`;
                 });
             }
             this.widgets.output.setContent(c);
@@ -201,15 +211,27 @@ export class DatabaseScreen {
         
         // Use setImmediate to allow the spinner to render before blocking operation
         await new Promise(resolve => setImmediate(resolve));
+        if (this._destroyed) {
+            // Screen gone while we waited — stop the spinner interval without
+            // touching widgets (blessed tolerates setContent on detached nodes,
+            // but avoid the pointless work).
+            spinner.stop();
+            return;
+        }
         
         try {
             const res = fn();
+            if (this._destroyed) {
+                spinner.stop();
+                return;
+            }
             spinner.stop(true);
             
             const hasFail = String(res).toLowerCase().includes('fail') || String(res).toLowerCase().includes('failed');
-            this.widgets.output.setContent(`\n{${hasFail ? 'red' : 'green'}-fg}${res}{/${hasFail ? 'red' : 'green'}-fg}`);
+            this.widgets.output.setContent(`\n{${hasFail ? 'red' : 'green'}-fg}${Validator.sanitizeBlessedTags(String(res))}{/${hasFail ? 'red' : 'green'}-fg}`);
         } catch (err) {
             spinner.stop(false);
+            if (this._destroyed) return;
             this.widgets.output.setContent(`\n{red-fg}Action failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
         }
         
@@ -234,7 +256,9 @@ export class DatabaseScreen {
             items: [msg, '  Yes, proceed', '  No, cancel']
         });
 
-        dialog.select(1);
+        // Default to the safe option — destructive actions should not be
+        // one accidental ENTER away.
+        dialog.select(2);
         dialog.focus();
         this.screen.render();
 
@@ -261,6 +285,8 @@ export class DatabaseScreen {
     }
 
     destroy() {
+        this._destroyed = true;
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

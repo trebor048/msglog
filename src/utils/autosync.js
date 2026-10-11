@@ -4,7 +4,8 @@ export function startAutoSync(ctx) {
     if (ctx.autoSyncEnabled || !ctx.listeningChannels.size) return;
 
     ctx.autoSyncEnabled = true;
-    const mins = (ctx.autoSyncIntervalMs / 1000 / 60).toFixed(0);
+    const totalMins = ctx.autoSyncIntervalMs / 1000 / 60;
+    const mins = totalMins < 1 ? '<1' : totalMins.toFixed(0);
     console.log(chalk.green(`✅ Autosync enabled (every ${mins} minutes)`));
 
     const runSync = async () => {
@@ -29,7 +30,7 @@ export function startAutoSync(ctx) {
     });
 
     ctx.autoSyncInterval = setInterval(() => {
-        if (ctx.isShuttingDown) {
+        if (ctx.isShuttingDown || !ctx.autoSyncEnabled) {
             clearInterval(ctx.autoSyncInterval);
             ctx.autoSyncInterval = null;
             return;

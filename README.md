@@ -6,7 +6,7 @@
 
 ## Requirements
 
-- Node.js 16 or newer
+- Node.js 20 or newer
 - A terminal with TTY support for the interactive interface
 - A Discord user token in a local `.env` file
 
@@ -32,7 +32,7 @@ npm start
 npm run verify
 ```
 
-This runs ESLint, the Node.js test suite, and the local doctor command. The doctor validates configuration, opens the configured SQLite database, applies migrations, and verifies the schema.
+This runs ESLint, the Node.js test suite, and the local doctor command. The doctor validates configuration, copies the configured SQLite database to a temp file, applies migrations on the copy, and runs integrity checks — the live database is never touched.
 
 ## Main Commands
 
@@ -41,7 +41,7 @@ This runs ESLint, the Node.js test suite, and the local doctor command. The doct
 | `npm start` | Start the logger and Blessed TUI |
 | `npm run lint` | Lint all JavaScript files |
 | `npm test` | Run the Node.js test suite |
-| `npm run doctor` | Validate configuration and database startup |
+| `npm run doctor` | Validate configuration and database integrity (on a temp DB copy) |
 | `npm run verify` | Run all pre-push checks |
 
 ## Data Safety

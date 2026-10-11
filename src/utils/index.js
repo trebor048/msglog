@@ -24,7 +24,7 @@ class AppContext {
     constructor(options) {
         const {
             config, client, db, jobManager, syncEngine, performance, circuitBreaker,
-            listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager, logger
+            listeningChannels, withRetry, gracefulShutdown, search, exporter, dbManager, logger, messageStore
         } = options;
         this.config = config;
         this.client = client;
@@ -40,6 +40,7 @@ class AppContext {
         this.exporter = exporter;
         this.dbManager = dbManager;
         this.logger = logger;
+        this.messageStore = messageStore;
         this.isPaused = false;
         this.isShuttingDown = false;
         this.autoSyncEnabled = false;
@@ -114,7 +115,7 @@ async function bootstrap() {
 
         const ctx = new AppContext({
             config, client, db, jobManager, syncEngine, performance, circuitBreaker,
-            listeningChannels, withRetry, gracefulShutdown: null, search, exporter, dbManager, logger
+            listeningChannels, withRetry, gracefulShutdown: null, search, exporter, dbManager, logger, messageStore
         });
 
         ctx.autoSyncIntervalMs = autoSyncSettings.intervalMs || 60 * 60 * 1000;
@@ -124,13 +125,17 @@ async function bootstrap() {
         ctx.teardownProcessErrorHandlers = setupProcessErrorHandlers(gracefulShutdown, logger);
         teardownProcessErrorHandlers = ctx.teardownProcessErrorHandlers;
 
-        // Wire up Discord rate-limit events to adaptive rate limiter
-        client.on('rateLimit', info => {
+        // Wire up Discord rate-limit events to adaptive rate limiter. The handler
+        // is kept by name so teardown can detach it — every client.on(...) here
+        // must have a symmetric client.off(...) (the client is destroyed right
+        // after teardown, but the listener registry should stay balanced).
+        const onRateLimit = (info) => {
             const match = info.path?.match(/\/channels\/(\d+)\/messages/);
             const channelId = match ? match[1] : 'global';
-            const timeout = info.timeout ?? info.time ?? 0;
+            const timeout = info.timeout ?? 0;
             rateLimiter.updateFromRateLimit(channelId, timeout, info.global);
-        });
+        };
+        client.on('rateLimit', onRateLimit);
 
         // Setup shutdown handlers
         ctx.teardownShutdownHandlers = setupShutdownHandlers(client, db, jobManager, ctx, gracefulShutdown);
@@ -148,12 +153,14 @@ async function bootstrap() {
                     processEmbeds(embeds, channelId,
                         (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId),
                         config, messageId),
-                () => ctx.isShuttingDown
+                // Realtime path gates on pause (not shutdown): the shutdown drain
+                // must still be able to write queued messages before the DB closes.
+                () => ctx.isPaused
             );
         };
 
         // Setup event handlers
-        ctx.teardownEventHandlers = setupEventHandlers(
+        const eventTeardown = setupEventHandlers(
             client,
             listeningChannels,
             messageStore,
@@ -163,20 +170,16 @@ async function bootstrap() {
             config,
             ctx.runtimeMetrics
         );
+        // Also detach the rate-limit listener so every client.on(...) registered
+        // here has a symmetric off() on teardown.
+        ctx.teardownEventHandlers = async () => {
+            client.off('rateLimit', onRateLimit);
+            await eventTeardown();
+        };
         teardownEventHandlers = ctx.teardownEventHandlers;
 
-        // Login and start
-        client.login(process.env.USER_TOKEN).catch(async err => {
-            await handleFatalStartup('Login failed', err, {
-                client,
-                db,
-                logger,
-                teardownProcessErrorHandlers,
-                teardownEventHandlers,
-                teardownShutdownHandlers
-            });
-        });
-
+        // Register ready handler BEFORE login so we never miss the event
+        // (login() can resolve before the client-level ready event fires).
         client.once('ready', () => {
             console.log(chalk.green(`✅ Logged in as ${client.user.tag}`));
             if (autoSyncSettings.enabled && listeningChannels.size) {
@@ -186,9 +189,24 @@ async function bootstrap() {
             startBlessedTUI(ctx).catch(err => {
                 console.error(chalk.red('❌ TUI error:', err.message));
                 logger?.error('TUI error', { error: err.message });
-                gracefulShutdown('tui error', { exitCode: 1 });
+                gracefulShutdown('tui error', { exitCode: 1 }).catch(() => {});
             });
         });
+
+        // Login and start
+        try {
+            await client.login(process.env.USER_TOKEN);
+        } catch (err) {
+            await handleFatalStartup('Login failed', err, {
+                client,
+                db,
+                logger,
+                teardownProcessErrorHandlers,
+                teardownEventHandlers,
+                teardownShutdownHandlers
+            });
+            return;
+        }
 
     } catch (err) {
         await handleFatalStartup('Bootstrap error', err, {
@@ -202,4 +220,7 @@ async function bootstrap() {
     }
 }
 
-bootstrap();
+bootstrap().catch(err => {
+    console.error(chalk.red('❌ Fatal bootstrap error:', err));
+    process.exit(1);
+});

@@ -13,6 +13,7 @@ import ViewChannelsScreen from './screens/ViewChannelsScreen.js';
 import SystemInfoScreen from './screens/SystemInfoScreen.js';
 import { sleep } from '../utils/utils.js';
 import { startAutoSync, stopAutoSync } from '../utils/autosync.js';
+import { BORDER_TYPE } from '../utils/terminal.js';
 
 // Table-driven action dispatch — add new screens here, no switch-statement changes needed
 const ACTION_SCREENS = {
@@ -53,64 +54,106 @@ export class BlessedTUIApp {
     setupGlobalKeys() {
         const screen = this.screenManager.getScreen();
 
+        // An input widget currently owns the keyboard. Blessed's `grabKeys`
+        // gate already suppresses screen-level keys while a textbox/textarea is
+        // *reading*, but the blessed `question` widget never sets grabKeys, so
+        // global shortcuts WOULD fire while a y/n question is on screen. Guard
+        // every global shortcut so Ctrl+L/S/E/V and F1/? never yank the user
+        // out of a prompt mid-typing.
+        const isTyping = () => {
+            const focused = screen.focused;
+            return Boolean(focused && (
+                focused.type === 'textbox' ||
+                focused.type === 'textarea' ||
+                focused.type === 'question'
+            ));
+        };
+
         // Global shortcuts
-        screen.key(['f1', '?'], () => this.showHelpOverlay());
-        screen.key(['C-l'], () => this.handleAction('live-monitor'));
-        screen.key(['C-s'], () => this.handleAction('search'));
-        screen.key(['C-m'], () => this.handleAction('manage-channels'));
-        screen.key(['C-e'], () => this.handleAction('export'));
-        screen.key(['C-v'], () => this.handleAction('view-channels'));
+        screen.key(['f1', '?'], () => {
+            // Don't open help while typing in a text input — a literal '?' typed
+            // into a search/filename prompt shouldn't pop the overlay.
+            if (isTyping()) return;
+            // Don't re-create the overlay if it is already open (avoids the
+            // flicker/focus-churn of destroy + rebuild on every '?').
+            if (this._helpBox) return;
+            this.showHelpOverlay();
+        });
+        screen.key(['C-l'], () => { if (!isTyping()) this.handleAction('live-monitor'); });
+        screen.key(['C-s'], () => { if (!isTyping()) this.handleAction('search'); });
+        screen.key(['C-e'], () => { if (!isTyping()) this.handleAction('export'); });
+        screen.key(['C-v'], () => { if (!isTyping()) this.handleAction('view-channels'); });
+
+        // NOTE: no 'C-m' binding — in blessed a physical Ctrl+M is the same
+        // byte as Enter (\r) and is normalized to the 'enter' key, so a
+        // 'C-m' handler can never fire. Manage Channels stays reachable via
+        // the main menu.
     }
 
     showHelpOverlay() {
         const screen = this.screenManager.getScreen();
+
+        // Close any existing help overlay and remove its stale close handler
+        if (this._helpBox) {
+            if (this._helpClose) screen.removeKey(['escape', 'q', 'enter', 'space'], this._helpClose);
+            try { this._helpBox.destroy(); } catch {}
+            this._helpBox = null;
+            this._helpClose = null;
+        }
+
         const helpBox = blessed.box({
             parent: screen,
             top: 'center', left: 'center',
-            width: 60, height: 16,
-            border: { type: 'line' },
+            width: 66, height: 16,
+            border: { type: BORDER_TYPE },
             tags: true,
-            label: ' Global Help ',
+            label: ' Help ',
+            focusable: true,
+            keys: true,
+            mouse: true,
             style: {
                 border: { fg: 'yellow' },
                 bg: 'black',
                 fg: 'white'
             },
-            content: 
+            content:
                 '\n{cyan-fg}{bold}Global Shortcuts{/bold}{/cyan-fg}\n' +
-                ' {yellow-fg}F1 / ?{/yellow-fg}      Show this help\n' +
-                ' {yellow-fg}CTRL+M{/yellow-fg}      Manage Channels\n' +
-                ' {yellow-fg}CTRL+L{/yellow-fg}      Live Monitor\n' +
-                ' {yellow-fg}CTRL+S{/yellow-fg}      Search Messages\n' +
-                ' {yellow-fg}CTRL+E{/yellow-fg}      Export Data\n' +
-                ' {yellow-fg}CTRL+V{/yellow-fg}      View Channels\n' +
-                ' {yellow-fg}ESC / Q{/yellow-fg}      Back / Close Overlay\n\n' +
+                ' {yellow-fg}F1/?{/yellow-fg}   Help          {yellow-fg}CTRL+L{/yellow-fg}  Live Monitor\n' +
+                ' {yellow-fg}CTRL+S{/yellow-fg} Search        {yellow-fg}CTRL+E{/yellow-fg}  Export Data\n' +
+                ' {yellow-fg}CTRL+V{/yellow-fg} View Channels {yellow-fg}ESC/Q{/yellow-fg}    Back\n\n' +
                 '{cyan-fg}{bold}Navigation{/bold}{/cyan-fg}\n' +
-                ' {yellow-fg}Arrows / HJ KL{/yellow-fg} Navigate lists\n' +
-                ' {yellow-fg}ENTER{/yellow-fg}           Select / Confirm\n' +
-                ' {yellow-fg}TAB{/yellow-fg}             Switch between panels\n\n' +
-                ' {gray-fg}Press any key to close{/gray-fg}'
+                ' {yellow-fg}Arrows/HJKL{/yellow-fg} Move       {yellow-fg}ENTER{/yellow-fg}  Select\n' +
+                ' {yellow-fg}TAB{/yellow-fg}  Switch panel\n\n' +
+                '{cyan-fg}{bold}Live Monitor{/bold}{/cyan-fg}\n' +
+                ' {yellow-fg}C{/yellow-fg}  Cancel job    {yellow-fg}D{/yellow-fg}  Delete job\n' +
+                ' {yellow-fg}UP/DOWN{/yellow-fg} Scroll log (pauses auto-scroll)\n\n' +
+                ' {gray-fg}ESC / Q / ENTER / SPACE to close{/gray-fg}'
         });
-
+        this._helpBox = helpBox;
+        helpBox.focus();
         screen.render();
 
         const close = () => {
+            if (this._helpClose) screen.removeKey(['escape', 'q', 'enter', 'space'], this._helpClose);
             helpBox.destroy();
+            this._helpBox = null;
+            this._helpClose = null;
             screen.render();
-            // onceKey auto-unregisters on fire, but click path needs explicit cleanup
-            screen.removeKey(['escape', 'q', 'enter', 'space'], close);
             // Re-focus current screen's main interactive widget
             if (this.currentScreen?.widgets) {
                 const w = this.currentScreen.widgets;
-                (w.menu || w.jobList || w.table || w.health || w.content || w.main)?.focus();
+                (w.menu || w.jobList || w.list || w.table || w.health || w.content || w.main)?.focus();
             }
         };
+        this._helpClose = close;
 
         helpBox.on('click', close);
+        // Focus the help box so close keys don't also reach the underlying screen
         screen.onceKey(['escape', 'q', 'enter', 'space'], close);
     }
 
     showMainMenu() {
+        this.closeHelpOverlay();
         if (this.currentScreen) this.currentScreen.destroy();
         this.currentScreen = new MainMenu(
             this.screenManager.getScreen(),
@@ -118,6 +161,16 @@ export class BlessedTUIApp {
             (action) => this.handleAction(action)
         );
         this.screenManager.render();
+    }
+
+    closeHelpOverlay() {
+        if (this._helpBox) {
+            if (this._helpClose) this.screenManager.getScreen().removeKey(['escape', 'q', 'enter', 'space'], this._helpClose);
+            try { this._helpBox.destroy(); } catch {}
+            this._helpBox = null;
+            this._helpClose = null;
+            this.screenManager.render();
+        }
     }
 
     async handleAction(action) {
@@ -162,6 +215,7 @@ export class BlessedTUIApp {
      * Generic screen launcher — creates a screen with standard onBack
      */
     showScreen(ScreenClass) {
+        this.closeHelpOverlay();
         if (this.currentScreen) this.currentScreen.destroy();
         this.currentScreen = new ScreenClass(
             this.screenManager.getScreen(),
@@ -172,6 +226,7 @@ export class BlessedTUIApp {
     }
 
     showLiveMonitor() {
+        this.closeHelpOverlay();
         if (this.currentScreen) this.currentScreen.destroy();
         this.currentScreen = new LiveMonitor(
             this.screenManager.getScreen(),
@@ -225,6 +280,9 @@ export class BlessedTUIApp {
             if (this.ctx.listeningChannels.size) {
                 startAutoSync(this.ctx);
                 this.ctx.dbManager?.saveAutoSync(true, this.ctx.autoSyncIntervalMs);
+            } else {
+                // No channels to sync — surface feedback instead of silently no-op
+                this.ctx.logger?.warn?.('Autosync toggle ignored: no listening channels');
             }
         }
 

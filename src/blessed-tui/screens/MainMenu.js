@@ -1,5 +1,6 @@
 import blessed from 'blessed';
-import { COLORS, STYLES } from '../themes/theme.js';
+import { COLORS, STYLES, border, tag, tagBold, dim } from '../themes/theme.js';
+import { formatDuration } from '../../utils/utils.js';
 
 /**
  * Main Menu Screen — entry point of the TUI
@@ -14,14 +15,26 @@ export class MainMenu {
         this.onBack = onBack;
         this.widgets = {};
         this.updateInterval = null;
+        this._resizeHandler = null;
 
         // Index-to-action mapping for the menu list
         this._actionMap = [];
         this._rebuildActionMap();
+        this._lastMenuFingerprint = ''; // Track menu item changes
 
         this.create();
         this.setupKeyBindings();
         this.startUpdates();
+
+        // Handle terminal resize — recalculate menu height
+        this._resizeHandler = () => {
+            const newHeight = this.screen.height - 9;
+            if (newHeight >= 5) {
+                this.widgets.menu.height = newHeight;
+                this.screen.render();
+            }
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     _rebuildActionMap() {
@@ -63,29 +76,30 @@ export class MainMenu {
             style: STYLES.mainBox(),
         });
 
-        // Header
+        // Header — app title + a subtle subtitle
         this.widgets.header = blessed.box({
             parent: this.widgets.main,
             top: 0, left: 0, width: '100%', height: 1,
             style: STYLES.header(),
-            content: ' DISCORD MESSAGE LOGGER',
+            content: ' MSG-LOG  ·  DISCORD MESSAGE LOGGER',
         });
 
-        // Status box — uses tags for colored output
+        // Dashboard status box — uses tags for colored output
         this.widgets.status = blessed.box({
             parent: this.widgets.main,
-            top: 1, left: 0, width: '100%', height: 4,
-            border: { type: 'line' },
+            top: 1, left: 0, width: '100%', height: 6,
+            border: border(COLORS.BORDER),
             tags: true,
+            label: ' Dashboard ',
             style: { border: { fg: COLORS.BORDER }, fg: COLORS.HIGHLIGHT },
         });
 
         // Menu list — items are plain strings, no Blessed tags in content
         this.widgets.menu = blessed.list({
             parent: this.widgets.main,
-            top: 5, left: 0, width: '100%',
-            height: this.screen.height - 7,
-            border: { type: 'line' },
+            top: 7, left: 0, width: '100%',
+            height: this.screen.height - 9,
+            border: border(COLORS.BORDER),
             tags: false,
             label: ' Menu ',
             style: {
@@ -104,7 +118,7 @@ export class MainMenu {
             parent: this.widgets.main,
             bottom: 0, left: 0, width: '100%', height: 1,
             style: STYLES.footer(),
-            content: ' UP/DOWN Navigate  ENTER Select  ? Help  ESC/Q Back  Ctrl+C Exit',
+            content: ' UP/DOWN Navigate   ENTER Select   F1/? Help   ESC/Q Exit   Ctrl+C Quit',
         });
 
         this.widgets.menu.focus();
@@ -151,17 +165,20 @@ export class MainMenu {
         const failed = allJobs.filter(j => j.status === 'error');
 
         const statusLabel = this.ctx.isPaused
-            ? 'PAUSED'
+            ? tagBold('yellow', 'PAUSED')
             : running.length
-                ? `WORKING (${running.length} jobs)`
-                : 'ACTIVE';
+                ? tagBold('cyan', `WORKING (${running.length})`)
+                : tagBold('green', 'ACTIVE');
 
-        // Use tags for status color coding
+        const uptime = formatDuration(this.ctx.performance?.getStats?.().uptime ?? 0);
+
         const text =
-            ` Status: ${statusLabel}\n` +
-            ` Autosync: ${this.ctx.autoSyncEnabled ? 'ON' : 'OFF'}\n` +
-            ` Channels: ${this.ctx.listeningChannels.size} listening\n` +
-            ` Jobs: ${running.length} running  ${completed.length} completed  ${failed.length} failed`;
+            `${tag('white', 'Status')}    ${statusLabel}\n` +
+            `${tag('white', 'Autosync')}  ${this.ctx.autoSyncEnabled ? tag('green', 'ON') : dim('OFF')}\n` +
+            `${tag('white', 'Channels')}  ${tag('cyan', String(this.ctx.listeningChannels.size))} listening\n` +
+            `${tag('white', 'Jobs')}      ${tag('cyan', String(running.length))} running  ` +
+            `${tag('green', String(completed.length))} done  ${tag('red', String(failed.length))} failed\n` +
+            `${tag('white', 'Uptime')}    ${dim(uptime)}`;
 
         this.widgets.status.setContent(text);
     }
@@ -174,13 +191,28 @@ export class MainMenu {
         this.updateStatus();
         this.updateInterval = setInterval(() => {
             this.updateStatus();
-            this.widgets.menu.setItems(this.buildMenuItems());
+
+            // Only rebuild menu items when toggles change (avoid resetting scroll/navigation)
+            const newItems = this.buildMenuItems();
+            const fp = newItems.join('|');
+            if (fp !== this._lastMenuFingerprint) {
+                this._lastMenuFingerprint = fp;
+                // Preserve the user's selection across setItems (blessed resets to
+                // index 0 otherwise).
+                const prevSelected = this.widgets.menu.selected;
+                this.widgets.menu.setItems(newItems);
+                if (prevSelected !== undefined && prevSelected < newItems.length) {
+                    this.widgets.menu.select(prevSelected);
+                }
+            }
+
             this.screen.render();
         }, 500);
     }
 
     destroy() {
         if (this.updateInterval) clearInterval(this.updateInterval);
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

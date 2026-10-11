@@ -11,6 +11,7 @@ export class StatsScreen {
         this.ctx = ctx;
         this.onBack = onBack;
         this.widgets = {};
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -56,9 +57,18 @@ export class StatsScreen {
         });
 
         this.widgets.table.focus();
+
+        this._resizeHandler = () => {
+            this.widgets.table.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     loadStats() {
+        let statsStmt = null;
+        let lastStmt = null;
+        let syncStmt = null;
         try {
             const channelIds = this.ctx.dbManager?.getChannelIds
                 ? this.ctx.dbManager.getChannelIds()
@@ -70,7 +80,7 @@ export class StatsScreen {
                 return;
             }
 
-            const statsStmt = this.ctx.db.prepare(`
+            statsStmt = this.ctx.db.prepare(`
                 SELECT
                     COUNT(*) AS total,
                     COUNT(CASE WHEN is_bot = 1 THEN 1 END) AS bots,
@@ -82,19 +92,18 @@ export class StatsScreen {
                 FROM messages WHERE channel_id = ?
             `);
 
-            const lastStmt = this.ctx.db.prepare(
+            lastStmt = this.ctx.db.prepare(
                 'SELECT timestamp FROM messages WHERE channel_id = ? AND deleted = 0 ORDER BY timestamp DESC LIMIT 1'
             );
 
-            const syncStmt = this.ctx.db.prepare('SELECT * FROM channel_sync_state WHERE channel_id = ?');
-
+            syncStmt = this.ctx.db.prepare('SELECT * FROM channel_sync_state WHERE channel_id = ?');
             let content = '{cyan-fg}{bold}CHANNEL STATISTICS{/bold}{/cyan-fg}\n';
             content += '{gray-fg}' + '─'.repeat(80) + '{/gray-fg}\n\n';
 
             channelIds.forEach(id => {
                 const ch = this.ctx.client.channels.cache.get(id);
                 const guild = ch?.guild?.name ? ` [${ch.guild.name}]` : '';
-                const rawName = ch ? `#${ch.name}${guild}` : `Unknown (${id})`;
+                const rawName = ch ? `#${ch?.name ?? 'Unknown Channel'}${guild}` : `Unknown (${id})`;
                 const name = Validator.sanitizeBlessedTags(rawName);
                 const listening = this.ctx.listeningChannels.has(id);
 
@@ -134,6 +143,12 @@ export class StatsScreen {
         } catch (err) {
             const safeMsg = Validator.sanitizeErrorMessage(err);
             this.widgets.table.setContent(`\n{red-fg}Error loading stats: ${safeMsg}{/red-fg}`);
+        } finally {
+            // Per-open statements — release them on every path (success or
+            // error) so the DB closes cleanly.
+            for (const stmt of [statsStmt, lastStmt, syncStmt]) {
+                try { if (stmt) stmt.finalize(); } catch {}
+            }
         }
         this.screen.render();
     }
@@ -143,6 +158,7 @@ export class StatsScreen {
     }
 
     destroy() {
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

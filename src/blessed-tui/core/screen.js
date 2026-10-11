@@ -11,6 +11,11 @@ export class ScreenManager {
             keyboard: true,
             title: 'Discord Logger - msg-log',
             smartCSR: true,
+            // 'C-c' stays routable even while a textbox/question is reading
+            // (blessed sets grabKeys and swallows screen-level keys during
+            // input); without this the advertised "Ctrl+C Quit" is dead
+            // whenever a prompt is open.
+            ignoreLocked: ['C-c'],
             style: {
                 border: { fg: 'cyan' },
                 focus: { bg: 'blue', fg: 'white' },
@@ -18,9 +23,11 @@ export class ScreenManager {
             }
         });
 
-        // Route Ctrl+C through normal signal handling so graceful shutdown runs.
+        // Route Ctrl+C through the registered signal handler so graceful
+        // shutdown runs. On Windows process.kill(pid,'SIGINT') hard-kills,
+        // so emit the signal directly to trigger the handler cross-platform.
         this.screen.key(['C-c'], () => {
-            process.kill(process.pid, 'SIGINT');
+            process.emit('SIGINT');
             return;
         });
     }

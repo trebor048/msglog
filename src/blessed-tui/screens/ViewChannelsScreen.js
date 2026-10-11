@@ -12,6 +12,8 @@ export class ViewChannelsScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.updateInterval = null;
+        this._lastChannelsHash = '';
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -57,9 +59,30 @@ export class ViewChannelsScreen {
         });
 
         this.widgets.content.focus();
+
+        this._resizeHandler = () => {
+            this.widgets.content.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     updateDisplay() {
+        // Fingerprinting: skip rebuild if job/channel list unchanged
+        const activeRunning = this.ctx.jobManager.getAllJobs().filter(j => j.status === 'running');
+        const channelNames = new Map();
+        (this.ctx.listeningChannels || []).forEach(id => {
+            const ch = this.ctx.client.channels.cache.get(id);
+            channelNames.set(id, ch?.name ?? null);
+        });
+        const hashData = JSON.stringify({
+            listening: [...(this.ctx.listeningChannels || [])],
+            channelNames: [...channelNames.entries()],
+            activeJobIds: activeRunning.map(j => j.id)
+        });
+        if (hashData === this._lastChannelsHash) return;
+        this._lastChannelsHash = hashData;
+
         let c = '\n';
 
         if (this.ctx.listeningChannels?.size) {
@@ -71,7 +94,8 @@ export class ViewChannelsScreen {
                     const guild = ch.guild?.name
                         ? ` {gray-fg}[${Validator.sanitizeBlessedTags(ch.guild.name)}]{/gray-fg}`
                         : '';
-                    c += `  {green-fg}• #${Validator.sanitizeBlessedTags(ch.name)}{/green-fg}${guild}\n`;
+                    const name = ch.name || '(DM)';
+                    c += `  {green-fg}• #${Validator.sanitizeBlessedTags(name)}{/green-fg}${guild}\n`;
                 } else {
                     c += `  {gray-fg}• Unknown channel (${id}){/gray-fg}\n`;
                 }
@@ -80,7 +104,6 @@ export class ViewChannelsScreen {
             c += '{yellow-fg}No channels currently listening{/yellow-fg}\n';
         }
 
-        const activeRunning = this.ctx.jobManager.getAllJobs().filter(j => j.status === 'running');
         const jobChannelIds = new Set(activeRunning.map(j => j.channelId));
 
         if (jobChannelIds.size) {
@@ -90,7 +113,12 @@ export class ViewChannelsScreen {
                 const ch = this.ctx.client.channels.cache.get(cid);
                 const jobs = activeRunning.filter(j => j.channelId === cid).map(j => `#${j.id}`).join(', ');
                 if (ch) {
-                    c += `  {blue-fg}• #${Validator.sanitizeBlessedTags(ch.name)}{/blue-fg} {gray-fg}(Jobs: ${jobs}){/gray-fg}\n`;
+                    const name = ch.name || '(DM)';
+                    c += `  {blue-fg}• #${Validator.sanitizeBlessedTags(name)}{/blue-fg} {gray-fg}(Jobs: ${jobs}){/gray-fg}\n`;
+                } else {
+                    // Channel not in cache (deleted / DM / just-gone) — still
+                    // surface the running job instead of silently dropping it.
+                    c += `  {gray-fg}• Unknown channel (${cid}) (Jobs: ${jobs}){/gray-fg}\n`;
                 }
             });
         } else {
@@ -107,11 +135,18 @@ export class ViewChannelsScreen {
 
     startUpdates() {
         this.updateDisplay();
-        this.updateInterval = setInterval(() => this.updateDisplay(), 1000);
+        this.updateInterval = setInterval(() => {
+            try {
+                this.updateDisplay();
+            } catch {
+                // Keep the screen alive even if update throws
+            }
+        }, 1000);
     }
 
     destroy() {
         if (this.updateInterval) clearInterval(this.updateInterval);
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

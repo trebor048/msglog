@@ -46,9 +46,11 @@ function redirectConsoleToFile() {
     const write = (level, args) => {
         let line;
         try {
-            line = `[${new Date().toISOString()}] [${level}] ${args.map(a =>
-                typeof a === 'string' ? a : JSON.stringify(a)
-            ).join(' ')}\n`;
+            line = `[${new Date().toISOString()}] [${level}] ${args.map(a => {
+                if (typeof a === 'string') return a;
+                if (a instanceof Error) return `${a.message}\n${a.stack ?? ''}`;
+                try { return JSON.stringify(a); } catch { return String(a); }
+            }).join(' ')}\n`;
         } catch {
             line = `[${new Date().toISOString()}] [${level}] [unserializable log args]\n`;
         }
@@ -125,6 +127,7 @@ export async function startBlessedTUI(ctx) {
         await app.start();
     } catch (err) {
         restoreConsole();
+        if (ctx) ctx._restoreConsole = null;
         // Now safe to print to terminal again
         process.stderr.write(`TUI startup error: ${err.message}\n${err.stack}\n`);
         throw err;

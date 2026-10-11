@@ -14,6 +14,7 @@ export class SearchScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.searchInstance = ctx.search;
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -93,15 +94,28 @@ export class SearchScreen {
 
         this.widgets.menu.on('select', (item, index) => this.handleMenuSelect(index));
 
-        // Tab switches focus between menu and results
-        this.widgets.main.key(['tab'], () => {
+        // Tab switches focus between menu and results.
+        // Bound at screen level (widget-level 'tab' only fires when focused,
+        // and the main container is never focused). Ignored while a prompt
+        // textbox is focused so TAB doesn't abandon an in-progress search.
+        this._handleTab = () => {
+            const focused = this.screen.focused;
+            if (focused && (focused.type === 'textbox' || focused.type === 'textarea')) return;
             if (this.widgets.menu.focused) {
                 this.widgets.results.focus();
             } else {
                 this.widgets.menu.focus();
             }
             this.screen.render();
-        });
+        };
+        this.screen.key(['tab'], this._handleTab);
+
+        this._resizeHandler = () => {
+            this.widgets.menu.height = this.screen.height - 3;
+            this.widgets.results.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     handleMenuSelect(index) {
@@ -189,6 +203,20 @@ export class SearchScreen {
                     return;
                 }
 
+                if (moment(endDate).isBefore(DISCORD_LAUNCH)) {
+                    this.widgets.results.setContent(`\n{red-fg}End date cannot be before Discord's launch (${DISCORD_LAUNCH}){/red-fg}`);
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
+                if (moment(startDate).isAfter(moment())) {
+                    this.widgets.results.setContent('\n{red-fg}Start date cannot be in the future{/red-fg}');
+                    this.widgets.menu.focus();
+                    this.screen.render();
+                    return;
+                }
+
                 if (moment(endDate).isAfter(moment())) {
                     this.widgets.results.setContent('\n{red-fg}End date cannot be in the future{/red-fg}');
                     this.widgets.menu.focus();
@@ -256,8 +284,11 @@ export class SearchScreen {
 
         results.slice(0, 50).forEach(msg => {
             const author = Validator.sanitizeBlessedTags(String(msg.author_tag || 'Unknown'));
-            const time = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : '';
-            const rawText = String(msg.content || '');
+            let time = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : '';
+            if (time === 'Invalid Date') time = '';
+            // Collapse newlines so multi-line message content can't break the
+            // one-row-per-message layout of the results box.
+            const rawText = String(msg.content || '').replace(/\s*\n\s*/g, ' ');
             const text = Validator.sanitizeBlessedTags(rawText.substring(0, 100));
             const suffix = rawText.length > 100 ? '...' : '';
             const channel = msg.channel_id
@@ -271,6 +302,7 @@ export class SearchScreen {
 
         this.widgets.results.setContent(content);
         this.widgets.results.setScrollPerc(0);
+        this.widgets.results.focus();
         this.screen.render();
     }
 
@@ -312,6 +344,8 @@ export class SearchScreen {
     }
 
     destroy() {
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
+        if (this._handleTab) this.screen.removeKey(['tab'], this._handleTab);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

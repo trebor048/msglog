@@ -11,6 +11,8 @@ export class HealthScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.updateInterval = null;
+        this._lastHealthHash = '';
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -56,6 +58,12 @@ export class HealthScreen {
         });
 
         this.widgets.health.focus();
+
+        this._resizeHandler = () => {
+            this.widgets.health.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     updateHealth() {
@@ -65,6 +73,17 @@ export class HealthScreen {
             this.ctx.listeningChannels
         );
         const runtime = this.ctx.runtimeMetrics || {};
+
+        // Fingerprinting: skip rebuild if nothing changed.
+        // Note: memoryUsage/uptime intentionally stay in the hash — a health
+        // screen must reflect live memory/uptime, so a per-tick rebuild is
+        // correct even though it defeats the fingerprint optimization.
+        const hashData = JSON.stringify({
+            ...healthStatus, ...runtime,
+            listeningChannelsSize: this.ctx.listeningChannels.size
+        });
+        if (hashData === this._lastHealthHash) return;
+        this._lastHealthHash = hashData;
 
         const heapUsed = healthStatus.memoryUsage.heapUsed / 1024 / 1024;
         const heapTotal = healthStatus.memoryUsage.heapTotal / 1024 / 1024;
@@ -123,13 +142,18 @@ export class HealthScreen {
     startUpdates() {
         this.updateHealth();
         this.updateInterval = setInterval(() => {
-            this.updateHealth();
-            this.screen.render();
+            try {
+                this.updateHealth();
+                this.screen.render();
+            } catch {
+                // Keep the screen alive even if health metrics throw
+            }
         }, 1000);
     }
 
     destroy() {
         if (this.updateInterval) clearInterval(this.updateInterval);
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

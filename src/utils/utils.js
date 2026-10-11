@@ -1,10 +1,48 @@
 import path from 'path';
+import fs from 'fs';
+import { SPINNER_FRAMES } from './terminal.js';
+
+// Windows reserved device names — creating a file with any of these names
+// (regardless of extension) fails on Windows, so they must never reach disk.
+const WINDOWS_RESERVED_NAMES = new Set([
+    'CON', 'PRN', 'AUX', 'NUL',
+    'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+    'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+    'CONIN$', 'CONOUT$',
+]);
+
+/**
+ * Canonicalize `p` by resolving symlinks in its deepest existing ancestor and
+ * re-appending the remaining (possibly not-yet-existing) components. Lets
+ * containment checks reject paths that reach outside the base directory
+ * through a symlink/junction without requiring the target file to exist yet.
+ */
+function _canonicalize(p) {
+    const rest = [];
+    let current = path.resolve(p);
+    for (;;) {
+        try {
+            const real = fs.realpathSync(current);
+            return rest.length === 0 ? real : path.join(real, ...rest);
+        } catch (err) {
+            // The path (or an ancestor) does not exist yet (ENOENT/ENOTDIR) or
+            // cannot be stat'd (EACCES/EPERM/UNKNOWN on unreachable UNC paths).
+            // Walk up and keep the rest lexical — the containment check still
+            // applies to it, so this is a graceful degradation, never a bypass.
+            const parent = path.dirname(current);
+            if (parent === current) return path.resolve(p); // at root — give up
+            rest.unshift(path.basename(current));
+            current = parent;
+        }
+    }
+}
 
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export const sleepJitter = ms => sleep(ms * (0.9 + Math.random() * 0.2));
 
 export const formatDuration = ms => {
+    if (!Number.isFinite(ms) || ms < 0) ms = 0;
     if (ms < 1000) return `${ms}ms`;
     const s = Math.floor(ms / 1000) % 60;
     const m = Math.floor(ms / 60_000) % 60;
@@ -33,8 +71,30 @@ export const resetStdin = () => {
 // Validation utilities
 export class Validator {
     static isValidDate(dateString) {
-        const date = new Date(dateString);
-        return date instanceof Date && !isNaN(date);
+        if (typeof dateString !== 'string') return false;
+        const trimmed = dateString.trim();
+        if (!trimmed) return false;
+        const date = new Date(trimmed);
+        if (isNaN(date.getTime())) return false;
+        // Rollover guard: '2026-02-30' silently becomes Mar 2, so verify the
+        // calendar components match the parsed date. Compare in the same frame
+        // the parser used — UTC for date-only ISO and TZ-aware strings, LOCAL
+        // for naive datetimes. Comparing date-only strings with local getters
+        // would reject every valid date in western timezones, because
+        // 'YYYY-MM-DD' parses as UTC midnight and the local day is the
+        // previous one (e.g. TZ=America/New_York → 2026-02-27).
+        const parts = trimmed.split(/[-T/ :]/).map(Number);
+        if (parts.length >= 3 && parts.slice(0, 3).every(Number.isInteger)) {
+            const [y, m, d] = parts;
+            if (y >= 1000 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+                const useUtc = !/[T:]/.test(trimmed) || /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed);
+                const yy = useUtc ? date.getUTCFullYear() : date.getFullYear();
+                const mm = useUtc ? date.getUTCMonth() + 1 : date.getMonth() + 1;
+                const dd = useUtc ? date.getUTCDate() : date.getDate();
+                if (yy !== y || mm !== m || dd !== d) return false;
+            }
+        }
+        return true;
     }
 
     static isValidDateRange(startDate, endDate) {
@@ -45,19 +105,24 @@ export class Validator {
     }
 
     static sanitizeFilename(filename) {
-        const cleaned = filename
-            .replace(/[<>:"|?*/\x00-\x1f]/g, '_')
+        const input = filename === null || filename === undefined ? '' : String(filename);
+        let cleaned = input
+            .replace(/[<>:"|?*\\/\x00-\x1f]/g, '_')
             .replace(/^\.+/, '')
-            .replace(/[. ]+$/g, '')
-            .substring(0, 255);
+            .replace(/[. ]+$/g, '');
+        // Windows caps a filename component at 255 UTF-16 code units. Truncate
+        // in code units, but never split a surrogate pair — a lone surrogate
+        // cannot be UTF-8 encoded and breaks the eventual file write.
+        if (cleaned.length > 255) {
+            cleaned = cleaned.slice(0, 255);
+            const last = cleaned.charCodeAt(cleaned.length - 1);
+            if (last >= 0xd800 && last <= 0xdbff) cleaned = cleaned.slice(0, -1);
+        }
+        // Re-strip trailing dots/spaces in case truncation reintroduced them
+        cleaned = cleaned.replace(/[. ]+$/g, '');
 
         const base = cleaned.split('.')[0]?.toUpperCase();
-        const reservedNames = new Set([
-            'CON', 'PRN', 'AUX', 'NUL',
-            'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
-            'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
-        ]);
-        if (!cleaned || reservedNames.has(base)) {
+        if (!cleaned || WINDOWS_RESERVED_NAMES.has(base)) {
             return `file_${Date.now()}`;
         }
         return cleaned;
@@ -65,12 +130,32 @@ export class Validator {
 
     /**
      * Verify a resolved path stays within a base directory.
-     * Returns null if safe, or the safe resolved path if within bounds.
+     * Throws if it escapes (traversal, absolute path, drive/UNC escape, or
+     * symlink redirect), otherwise returns the resolved path.
      */
     static validatePathConfinement(userPath, baseDir) {
-        const resolved = path.resolve(baseDir, userPath);
-        const normalizedBase = path.resolve(baseDir) + path.sep;
-        if (!resolved.startsWith(normalizedBase)) {
+        const resolved = path.resolve(baseDir, userPath || '.');
+        const normalizedBase = path.resolve(baseDir);
+        // The base dir itself (or a path resolving exactly to it) is always safe
+        if (resolved === normalizedBase) return resolved;
+
+        const lower = s => (process.platform === 'win32' ? s.toLowerCase() : s);
+        // Fast path: lexical containment. Catches '..' traversal, absolute
+        // paths, Windows drive letters, and UNC paths before any filesystem
+        // access (realpath'ing an unreachable \\server\share can block for
+        // seconds). Windows filesystems are case-insensitive, so compare
+        // case-insensitively there.
+        if (!lower(resolved).startsWith(lower(normalizedBase) + path.sep)) {
+            throw new Error(`Path traversal blocked: ${userPath} escapes ${baseDir}`);
+        }
+        // Symlink hardening: a symlink/junction inside the base directory must
+        // not redirect writes outside it. Realpath only the deepest existing
+        // ancestor so the target file does not need to exist yet (e.g. a new
+        // export file).
+        const b = lower(_canonicalize(normalizedBase));
+        const t = lower(_canonicalize(resolved));
+        const bSep = b.endsWith(path.sep) ? b : b + path.sep;
+        if (t !== b && !t.startsWith(bSep)) {
             throw new Error(`Path traversal blocked: ${userPath} escapes ${baseDir}`);
         }
         return resolved;
@@ -88,9 +173,19 @@ export class Validator {
             throw new Error('Database path contains invalid characters');
         }
         const resolved = path.resolve(projectDir, sanitized);
-        const normalizedBase = path.resolve(projectDir) + path.sep;
-        if (!resolved.startsWith(normalizedBase)) {
+        const normalizedBase = path.resolve(projectDir);
+
+        const lower = s => (process.platform === 'win32' ? s.toLowerCase() : s);
+        if (!lower(resolved).startsWith(lower(normalizedBase + path.sep))) {
             throw new Error('Database path must be within the project directory');
+        }
+
+        // The final component must be creatable on Windows: no reserved device
+        // name, no trailing dot/space, and within the 255-char limit.
+        const basename = path.basename(resolved);
+        const head = basename.split('.')[0]?.toUpperCase();
+        if (!basename || basename.length > 255 || /[. ]$/.test(basename) || WINDOWS_RESERVED_NAMES.has(head)) {
+            throw new Error('Database path must end in a valid filename');
         }
         return resolved;
     }
@@ -109,12 +204,67 @@ export class Validator {
     }
 
     /**
+     * Replace emoji characters with ASCII equivalents for terminals
+     * that cannot render them (showing '?' instead).
+     * Only affects emojis used in log/job messages — does NOT strip all Unicode.
+     */
+    static emojiToAscii(text) {
+        if (!text || typeof text !== 'string') return '';
+        const replacements = [
+            // Supplementary-plane emojis (with optional variation selector FE0F)
+            [/\u{1F4CD}\u{FE0F}?/gu, '>'],       // 📍 → >
+            [/\u{1F4E6}\u{FE0F}?/gu, '#'],       // 📦 → #
+            [/\u{1F493}\u{FE0F}?/gu, '*'],       // 💓 → *
+            [/\u{1F4CA}\u{FE0F}?/gu, '='],       // 📊 → =
+            [/\u{1F6D1}\u{FE0F}?/gu, '[]'],      // 🛑 → []
+            [/\u{1F680}\u{FE0F}?/gu, '->'],      // 🚀 → ->
+            // BMP emojis (with optional variation selector)
+            [/\u{23ED}\u{FE0F}?/gu, '>>'], // ⏭️ → >>
+            [/\u{23F8}\u{FE0F}?/gu, '||'], // ⏸️ → ||
+            [/\u{25B6}\u{FE0F}?/gu, '>'],  // ▶️ → >
+            [/\u{26A0}\u{FE0F}?/gu, '!'],  // ⚠️ → !
+            [/\u{2705}/gu, '[OK]'],     // ✅ → [OK]
+            [/\u{274C}/gu, '[ERR]'],    // ❌ → [ERR]
+            [/\u{2714}/gu, '[ok]'],     // ✔ → [ok]
+            [/\u{2718}/gu, '[x]'],      // ✘ → [x]
+            // Additional emoji used in job/log/console messages
+            [/\u{23F9}\u{FE0F}?/gu, '[]'],      // ⏹ → []
+            [/\u{1F4C1}\u{FE0F}?/gu, 'DIR'],    // 📁 → DIR
+            [/\u{1F50D}\u{FE0F}?/gu, '?'],      // 🔍 → ?
+            [/\u{1F50E}\u{FE0F}?/gu, '?'],      // 🔎 → ?
+            [/\u{1F44D}\u{FE0F}?/gu, '+1'],     // 👍 → +1
+            [/\u{23F3}\u{FE0F}?/gu, '...'],     // ⏳ → ...
+            [/\u{1F527}\u{FE0F}?/gu, '#'],      // 🔧 → #
+            [/\u{1F4BE}\u{FE0F}?/gu, 'save'],   // 💾 → save
+            [/\u{1F4E5}\u{FE0F}?/gu, '<-'],     // 📥 → <-
+            [/\u{1F4CC}\u{FE0F}?/gu, 'P'],      // 📌 → P
+            [/\u{1F9F9}\u{FE0F}?/gu, '~'],      // 🧹 → ~
+            [/\u{1F4CE}\u{FE0F}?/gu, '@'],      // 📎 → @
+            [/\u{1F528}\u{FE0F}?/gu, '#'],      // 🔨 → #
+            // Non-emoji but poorly rendered: em dash, en dash
+            [/\u{2014}/gu, '--'], // — → --
+            [/\u{2013}/gu, '-'],  // – → -
+        ];
+        for (const [re, ascii] of replacements) {
+            text = text.replace(re, ascii);
+        }
+        return text;
+    }
+
+    /**
      * Sanitize an error message for TUI display.
      * Strips file paths, stack traces, and internal details.
      */
     static sanitizeErrorMessage(err) {
         if (!err) return 'Unknown error';
-        const msg = err.message || String(err);
+        let msg;
+        if (err instanceof Error) {
+            msg = err.message;
+        } else if (typeof err === 'string') {
+            msg = err;
+        } else {
+            try { msg = JSON.stringify(err); } catch { msg = String(err); }
+        }
         // Truncate at first newline (stack trace follows)
         const firstLine = msg.split('\n')[0];
         // Cap length
@@ -139,7 +289,8 @@ export class Validator {
             }
         }
 
-        if (filters.limit && (filters.limit < 1 || filters.limit > 10000)) {
+        if (filters.limit !== undefined && filters.limit !== null && filters.limit !== '' &&
+            (filters.limit < 1 || filters.limit > 10000)) {
             errors.push('Limit must be between 1 and 10000');
         }
 
@@ -159,6 +310,8 @@ export class Validator {
         if (!config.databaseFile) errors.push('Database file not specified');
         if (config.globalDelay < 50) errors.push('Global delay must be at least 50ms');
         if (config.globalDelay > 30000) errors.push('Global delay cannot exceed 30000ms');
+        if (config.syncRequestDelayMs < 50) errors.push('Sync request delay must be at least 50ms');
+        if (config.syncRequestDelayMs > 5000) errors.push('Sync request delay cannot exceed 5000ms');
         if (config.maxConcurrentJobs < 1) errors.push('Max concurrent jobs must be at least 1');
         if (config.maxConcurrentJobs > 20) errors.push('Max concurrent jobs cannot exceed 20');
         if (config.maxRateLimitChannels < 100) errors.push('Max rate-limit channels must be at least 100');
@@ -167,6 +320,8 @@ export class Validator {
         if (config.maxSyncPages > 1000000) errors.push('Max sync pages cannot exceed 1000000');
         if (config.maxEventQueueSize < 100) errors.push('Max event queue size must be at least 100');
         if (config.maxEventQueueSize > 100000) errors.push('Max event queue size cannot exceed 100000');
+        if (config.maxQueueWorkers < 1) errors.push('Max queue workers must be at least 1');
+        if (config.maxQueueWorkers > 20) errors.push('Max queue workers cannot exceed 20');
         if (config.deletedRetentionDays < 1) errors.push('Deleted retention days must be at least 1');
         if (config.deletedRetentionDays > 3650) errors.push('Deleted retention days cannot exceed 3650');
         if (config.retryAttempts < 1) errors.push('Retry attempts must be at least 1');
@@ -213,6 +368,7 @@ export class Spinner {
             process.stdout.write(`\r${frame} ${this.message} (${seconds}s)`);
             this.frameIndex++;
         }, 80);
+        if (typeof this.interval.unref === 'function') this.interval.unref();
     }
 
     update(message) {
@@ -278,7 +434,7 @@ export class ProgressBar {
     }
 
     render() {
-        const percent = Math.min(100, (this.current / this.total) * 100);
+        const percent = this.total > 0 ? Math.min(100, (this.current / this.total) * 100) : 100;
         const filled = Math.floor((percent / 100) * this.width);
         const empty = this.width - filled;
         const bar = '█'.repeat(filled) + '░'.repeat(empty);
@@ -288,7 +444,7 @@ export class ProgressBar {
         
         // Calculate ETA if we have progress
         let eta = '';
-        if (this.current > 0 && percent < 100) {
+        if (this.current > 0 && percent < 100 && this.total > 0) {
             const estimatedTotalTime = (elapsed / percent) * 100;
             const remainingTime = estimatedTotalTime - elapsed;
             const remainingSeconds = Math.floor(remainingTime / 1000);
@@ -330,7 +486,7 @@ export class ProgressBar {
 
 // TUI-compatible spinner for Blessed.js applications
 export class TuiSpinner {
-    constructor(widget, message = 'Processing...', frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']) {
+    constructor(widget, message = 'Processing...', frames = SPINNER_FRAMES) {
         this.widget = widget;
         this.message = message;
         this.frames = frames;
@@ -352,10 +508,11 @@ export class TuiSpinner {
             const elapsed = Date.now() - this.startTime;
             const seconds = Math.floor(elapsed / 1000);
             
-            this.widget.setContent(`\n{yellow-fg}${frame} ${this.message} (${seconds}s){/yellow-fg}`);
+            this.widget.setContent(`\n{yellow-fg}${frame} ${Validator.sanitizeBlessedTags(this.message)} (${seconds}s){/yellow-fg}`);
             this.widget.screen.render();
             this.frameIndex++;
         }, 80);
+        if (typeof this.interval.unref === 'function') this.interval.unref();
     }
 
     update(message) {
@@ -373,10 +530,10 @@ export class TuiSpinner {
         
         if (finalMessage) {
             const icon = success ? '✅' : '❌';
-            this.widget.setContent(`\n{${success ? 'green' : 'red'}-fg}${icon} ${finalMessage} (${seconds}s){/${success ? 'green' : 'red'}-fg}`);
+            this.widget.setContent(`\n{${success ? 'green' : 'red'}-fg}${icon} ${Validator.sanitizeBlessedTags(finalMessage)} (${seconds}s){/${success ? 'green' : 'red'}-fg}`);
         } else {
             const icon = success ? '✅' : '❌';
-            this.widget.setContent(`\n{${success ? 'green' : 'red'}-fg}${icon} ${this.message} completed (${seconds}s){/${success ? 'green' : 'red'}-fg}`);
+            this.widget.setContent(`\n{${success ? 'green' : 'red'}-fg}${icon} ${Validator.sanitizeBlessedTags(this.message)} completed (${seconds}s){/${success ? 'green' : 'red'}-fg}`);
         }
         this.widget.screen.render();
     }
@@ -420,7 +577,7 @@ export class TuiProgressBar {
     }
 
     render() {
-        const percent = Math.min(100, (this.current / this.total) * 100);
+        const percent = this.total > 0 ? Math.min(100, (this.current / this.total) * 100) : 100;
         const filled = Math.floor((percent / 100) * this.width);
         const empty = this.width - filled;
         const bar = '█'.repeat(filled) + '░'.repeat(empty);
@@ -430,14 +587,14 @@ export class TuiProgressBar {
         
         // Calculate ETA if we have progress
         let eta = '';
-        if (this.current > 0 && percent < 100) {
+        if (this.current > 0 && percent < 100 && this.total > 0) {
             const estimatedTotalTime = (elapsed / percent) * 100;
             const remainingTime = estimatedTotalTime - elapsed;
             const remainingSeconds = Math.floor(remainingTime / 1000);
             eta = `ETA: ${remainingSeconds}s`;
         }
         
-        const content = `\n{cyan-fg}${this.message}{/cyan-fg}\n` +
+        const content = `\n{cyan-fg}${Validator.sanitizeBlessedTags(this.message)}{/cyan-fg}\n` +
                        `{green-fg}[${bar}]{/green-fg}\n` +
                        `{white-fg}${percent.toFixed(1)}% ${this.current}/${this.total} (${seconds}s) ${eta}{/white-fg}`;
         
@@ -450,9 +607,9 @@ export class TuiProgressBar {
         const seconds = (elapsed / 1000).toFixed(1);
         
         if (finalMessage) {
-            this.widget.setContent(`\n{green-fg}✅ ${finalMessage} (${seconds}s){/green-fg}`);
+            this.widget.setContent(`\n{green-fg}✅ ${Validator.sanitizeBlessedTags(finalMessage)} (${seconds}s){/green-fg}`);
         } else {
-            this.widget.setContent(`\n{green-fg}✅ ${this.message} completed (${seconds}s){/green-fg}`);
+            this.widget.setContent(`\n{green-fg}✅ ${Validator.sanitizeBlessedTags(this.message)} completed (${seconds}s){/green-fg}`);
         }
         this.widget.screen.render();
     }
@@ -470,7 +627,7 @@ export class TuiProgressBar {
         } catch (error) {
             const elapsed = Date.now() - progress.startTime;
             const seconds = (elapsed / 1000).toFixed(1);
-            widget.setContent(`\n{red-fg}❌ ${message} failed: ${error.message} (${seconds}s){/red-fg}`);
+            widget.setContent(`\n{red-fg}❌ ${Validator.sanitizeBlessedTags(message)} failed: ${Validator.sanitizeBlessedTags(String(error?.message ?? error))} (${seconds}s){/red-fg}`);
             widget.screen.render();
             throw error;
         }

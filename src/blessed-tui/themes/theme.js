@@ -2,6 +2,7 @@
  * Centralized theme constants for the Blessed TUI.
  * Every screen imports from here instead of hardcoding color strings.
  */
+import { BORDER_TYPE, SPINNER_FRAMES, TERMINAL } from '../../utils/terminal.js';
 
 export const COLORS = {
     // Core palette
@@ -111,4 +112,22 @@ export const tag = (color, text) => `{${color}-fg}${text}{/${color}-fg}`;
 export const tagBold = (color, text) => `{${color}-fg}{bold}${text}{/bold}{/${color}-fg}`;
 export const dim = (text) => `{gray-fg}${text}{/gray-fg}`;
 
-export default { COLORS, STYLES, LAYOUT, tag, tagBold, dim };
+/**
+ * Cross-platform helpers — resolve the right border glyph set and spinner
+ * frames for the current terminal (braille vs ASCII fallback on Windows cmd /
+ * PowerShell 5.1, which lack those glyphs).
+ */
+export const terminal = TERMINAL;
+export const spinnerFrames = SPINNER_FRAMES;
+
+/**
+ * Standard bordered style shared by every panel. color = border color.
+ * Include the terminal-appropriate border type. (The `label` panel title is a
+ * separate blessed option — pass it alongside, not inside this object.)
+ */
+export const border = (color = COLORS.BORDER) => ({
+    type: BORDER_TYPE,
+    fg: color,
+});
+
+export default { COLORS, STYLES, LAYOUT, tag, tagBold, dim, terminal, spinnerFrames, border };

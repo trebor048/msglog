@@ -6,7 +6,8 @@ export async function cleanupStartupResources({
     db = null,
     teardownProcessErrorHandlers = null,
     teardownEventHandlers = null,
-    teardownShutdownHandlers = null
+    teardownShutdownHandlers = null,
+    logger = null
 } = {}) {
     try {
         if (typeof teardownProcessErrorHandlers === 'function') {
@@ -15,7 +16,7 @@ export async function cleanupStartupResources({
     } catch {}
     try {
         if (typeof teardownEventHandlers === 'function') {
-            teardownEventHandlers();
+            await teardownEventHandlers();
         }
     } catch {}
     try {
@@ -26,11 +27,17 @@ export async function cleanupStartupResources({
 
     try {
         if (client && typeof client.destroy === 'function') {
-            client.destroy();
+            await client.destroy();
         }
     } catch {}
 
     closeDatabase(db);
+
+    try {
+        if (logger && typeof logger.flush === 'function') {
+            await logger.flush();
+        }
+    } catch {}
 }
 
 export async function handleFatalStartup(stage, err, resources = {}) {
@@ -39,10 +46,30 @@ export async function handleFatalStartup(stage, err, resources = {}) {
     console.error(chalk.red(`❌ ${prefix}${message}`));
     resources.logger?.error?.('Fatal startup error', { stage, error: message });
 
-    await cleanupStartupResources(resources);
+    // Arm the force-exit BEFORE cleanup so a hanging client.destroy() on a
+    // partially-initialized client can't block startup recovery forever.
+    let forced = false;
+    const forceExit = setTimeout(() => {
+        if (!forced) { forced = true; process.exit(process.exitCode ?? 1); }
+    }, 3_000);
+    if (typeof forceExit.unref === 'function') forceExit.unref();
 
-    // Avoid hard process termination; allow a coordinated exit path.
+    try {
+        await cleanupStartupResources(resources);
+    } finally {
+        clearTimeout(forceExit);
+    }
+
+    // Terminal — process is in an unrecoverable state after cleanup.
+    // Set exitCode rather than hard-exiting so pending microtasks/test
+    // assertions can complete; the unref'd fallback forces the exit if a stray
+    // handle (socket/timer) would otherwise keep the loop alive.
     if (!process.exitCode || process.exitCode === 0) {
         process.exitCode = 1;
+    }
+    // Skip the force-exit fallback in tests so it can't kill the runner mid-suite.
+    if (process.env.NODE_ENV !== 'test') {
+        const fallbackExit = setTimeout(() => process.exit(process.exitCode ?? 1), 2_000);
+        if (typeof fallbackExit.unref === 'function') fallbackExit.unref();
     }
 }

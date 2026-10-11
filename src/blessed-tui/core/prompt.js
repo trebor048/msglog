@@ -12,6 +12,10 @@ import blessed from 'blessed';
  */
 export function promptInput(screen, parent, label, defaultVal = '') {
     return new Promise((resolve) => {
+        // Remember what had focus so we can hand it back after the prompt
+        // closes — otherwise widget-level key bindings silently stop working.
+        const prevFocused = screen.focused;
+
         const input = blessed.textbox({
             parent,
             top: 'center',
@@ -26,21 +30,24 @@ export function promptInput(screen, parent, label, defaultVal = '') {
             mouse: true,
         });
 
-        screen.render();
+        // Set the default BEFORE the first render so it is visible immediately.
         input.setValue(defaultVal);
+        screen.render();
         input.focus();
 
-        input.key('enter', () => {
-            const val = input.getValue() || defaultVal;
+        const finish = (value) => {
             input.destroy();
+            if (prevFocused && !prevFocused.destroyed) prevFocused.focus();
             screen.render();
-            resolve(val);
+            resolve(value);
+        };
+
+        input.key('enter', () => {
+            finish(input.getValue() || defaultVal);
         });
 
         input.key('escape', () => {
-            input.destroy();
-            screen.render();
-            resolve(null);
+            finish(null);
         });
     });
 }
@@ -51,6 +58,9 @@ export function promptInput(screen, parent, label, defaultVal = '') {
  */
 export function confirmDialog(screen, parent, message) {
     return new Promise((resolve) => {
+        // Remember what had focus so we can hand it back after the dialog closes.
+        const prevFocused = screen.focused;
+
         const dialog = blessed.list({
             parent,
             top: 'center',
@@ -76,16 +86,19 @@ export function confirmDialog(screen, parent, message) {
         dialog.focus();
         screen.render();
 
-        dialog.on('select', (item, index) => {
+        const finish = (value) => {
             dialog.destroy();
+            if (prevFocused && !prevFocused.destroyed) prevFocused.focus();
             screen.render();
-            resolve(index === 1);
+            resolve(value);
+        };
+
+        dialog.on('select', (item, index) => {
+            finish(index === 1);
         });
 
         dialog.key(['escape', 'q'], () => {
-            dialog.destroy();
-            screen.render();
-            resolve(false);
+            finish(false);
         });
     });
 }

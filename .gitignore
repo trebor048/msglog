@@ -70,3 +70,5 @@ desktop.ini
 
 # Local tools
 .qwen/
+.opencode/
+memory/

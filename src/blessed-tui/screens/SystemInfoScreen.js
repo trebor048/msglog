@@ -12,6 +12,8 @@ export class SystemInfoScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.updateInterval = null;
+        this._lastStatsHash = '';
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -57,11 +59,30 @@ export class SystemInfoScreen {
         });
 
         this.widgets.content.focus();
+
+        this._resizeHandler = () => {
+            this.widgets.content.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     updateDisplay() {
         const stats = this.ctx.performance.getStats();
         const runtime = this.ctx.runtimeMetrics || {};
+
+        // Fingerprinting: skip rebuild if nothing changed. Exclude the raw
+        // ms-precision uptime from the spread (it changes every tick); include
+        // only a whole-second version so the uptime line stays live while the
+        // optimization can actually fire.
+        const { uptime: _uptime, ...rest } = stats;
+        const hashData = JSON.stringify({
+            ...rest,
+            uptimeSec: Math.floor(_uptime / 1000),
+            ...runtime
+        });
+        if (hashData === this._lastStatsHash) return;
+        this._lastStatsHash = hashData;
 
         let c = '\n{cyan-fg}{bold}Session Statistics{/bold}{/cyan-fg}\n';
         c += '{gray-fg}' + '─'.repeat(50) + '{/gray-fg}\n\n';
@@ -80,20 +101,19 @@ export class SystemInfoScreen {
 
         if (stats.lastSync) {
             c += `\n{cyan-fg}{bold}Latest Sync{/bold}{/cyan-fg}\n`;
-            c += `  Channel ID: {gray-fg}${stats.lastSync.channelId}{/gray-fg}\n`;
+            c += `  Channel ID: {gray-fg}${Validator.sanitizeBlessedTags(String(stats.lastSync.channelId ?? ''))}{/gray-fg}\n`;
             c += `  Messages:   {green-fg}${stats.lastSync.messageCount}{/green-fg}\n`;
-            c += `  Time:       {gray-fg}${stats.lastSync.timestamp}{/gray-fg}\n`;
+            c += `  Time:       {gray-fg}${Validator.sanitizeBlessedTags(String(stats.lastSync.timestamp ?? ''))}{/gray-fg}\n`;
         }
 
         if (stats.lastError) {
-            const rawMsg = typeof stats.lastError === 'object'
-                ? (stats.lastError.message || String(stats.lastError))
-                : String(stats.lastError);
-            const safeMsg = Validator.sanitizeBlessedTags(rawMsg.substring(0, 200));
+            // Route through sanitizeErrorMessage: it truncates at the first
+            // newline (stack traces), caps length, and sanitizes blessed tags.
+            const safeMsg = Validator.sanitizeErrorMessage(stats.lastError);
             c += `\n{red-fg}{bold}Last Error{/bold}{/red-fg}\n`;
             c += `  {red-fg}${safeMsg}{/red-fg}\n`;
             if (typeof stats.lastError === 'object' && stats.lastError.timestamp) {
-                c += `  {gray-fg}${stats.lastError.timestamp}{/gray-fg}\n`;
+                c += `  {gray-fg}${Validator.sanitizeBlessedTags(String(stats.lastError.timestamp))}{/gray-fg}\n`;
             }
         }
 
@@ -106,12 +126,17 @@ export class SystemInfoScreen {
     }
 
     startUpdates() {
-        this.updateDisplay();
-        this.updateInterval = setInterval(() => this.updateDisplay(), 1000);
+        try { this.updateDisplay(); } catch {}
+        this.updateInterval = setInterval(() => {
+            try { this.updateDisplay(); } catch {
+                // Keep the screen alive even if stats rendering throws
+            }
+        }, 1000);
     }
 
     destroy() {
         if (this.updateInterval) clearInterval(this.updateInterval);
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

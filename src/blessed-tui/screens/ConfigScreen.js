@@ -12,6 +12,8 @@ export class ConfigScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.config = ctx.config;
+        this._destroyed = false;
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -80,13 +82,21 @@ export class ConfigScreen {
 
         this.widgets.menu.focus();
         this.widgets.menu.on('select', (item, index) => this.handleMenuSelect(index));
+
+        this._resizeHandler = () => {
+            this.widgets.menu.height = this.screen.height - 3;
+            this.widgets.output.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     getCurrentConfigDisplay() {
         let c = '\n{cyan-fg}{bold}Active Settings{/bold}{/cyan-fg}\n';
         c += '{gray-fg}' + '─'.repeat(40) + '{/gray-fg}\n\n';
-        c += ` Database:       {green-fg}${this.config.databaseFile}{/green-fg}\n`;
+        c += ` Database:       {green-fg}${Validator.sanitizeBlessedTags(this.config.databaseFile)}{/green-fg}\n`;
         c += ` Global Delay:   {green-fg}${this.config.globalDelay}ms{/green-fg}\n`;
+        c += ` Sync Delay:     {green-fg}${this.config.syncRequestDelayMs}ms{/green-fg} {gray-fg}(bulk fetch pacing){/gray-fg}\n`;
         c += ` Max Fast Req:   {green-fg}${this.config.maxFastRequests}{/green-fg}\n`;
         c += ` RL Channels:    {green-fg}${this.config.maxRateLimitChannels}{/green-fg}\n`;
         c += ` Max Sync Pages: {green-fg}${this.config.maxSyncPages}{/green-fg}\n`;
@@ -108,26 +118,48 @@ export class ConfigScreen {
 
     editDatabase() {
         this.promptInput('Database file path (.db):', this.config.databaseFile, async (val) => {
-            if (!val.endsWith('.db')) {
+            // Escape cancels — restore focus without touching config
+            if (val === null) {
+                this.widgets.menu.focus();
+                this.screen.render();
+                return;
+            }
+            if (!val.toLowerCase().endsWith('.db')) {
                 this.widgets.output.setContent('\n{red-fg}Error: File must end with .db{/red-fg}');
                 this.widgets.menu.focus();
                 this.screen.render();
                 return;
             }
+            // Validate path stays within project directory
             try {
-                // Validate path stays within project directory
                 Validator.validateDatabasePath(val, process.cwd());
-                this.config.databaseFile = val;
+            } catch (err) {
+                this.widgets.output.setContent(
+                    `\n{red-fg}Invalid path: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`
+                );
+                this.widgets.menu.focus();
+                this.screen.render();
+                return;
+            }
+
+            const previous = this.config.databaseFile;
+            this.config.databaseFile = val;
+            try {
                 await saveConfig(this.config);
                 this.widgets.output.setContent(
                     '\n{green-fg}Saved! Restart required for DB path change.{/green-fg}\n\n' +
                     this.getCurrentConfigDisplay()
                 );
             } catch (err) {
+                // Save failed — revert the in-memory path so a later unrelated
+                // saveConfig never persists a change the user was told failed.
+                this.config.databaseFile = previous;
                 this.widgets.output.setContent(
-                    `\n{red-fg}Invalid path: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`
+                    `\n{red-fg}Save failed — database path unchanged: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`
                 );
             }
+            // A global shortcut may have navigated away during the save await.
+            if (this._destroyed) return;
             this.widgets.menu.focus();
             this.screen.render();
         });
@@ -136,6 +168,7 @@ export class ConfigScreen {
     editDelays() {
         const fields = [
             { key: 'globalDelay', label: 'Global delay (ms)', min: 50, max: 30000 },
+            { key: 'syncRequestDelayMs', label: 'Sync fetch delay (ms) — lower = faster catch-up', min: 50, max: 5000 },
             { key: 'maxFastRequests', label: 'Max fast requests', min: 1, max: 1000 },
             { key: 'maxRateLimitChannels', label: 'Max rate-limit channels', min: 100, max: 500000 },
             { key: 'maxSyncPages', label: 'Max sync pages', min: 1, max: 1000000 },
@@ -144,23 +177,48 @@ export class ConfigScreen {
             { key: 'maxEventQueueSize', label: 'Max event queue size', min: 100, max: 100000 },
             { key: 'deletedRetentionDays', label: 'Deleted retention days', min: 1, max: 3650 }
         ];
-        this.editFieldChain(fields, 0);
+        // Snapshot the live values so escaping mid-chain restores them and a
+        // later unrelated saveConfig never persists abandoned partial edits.
+        const snapshot = Object.fromEntries(fields.map(f => [f.key, this.config[f.key]]));
+        this.editFieldChain(fields, 0, snapshot);
     }
 
-    async editFieldChain(fields, idx) {
+    async editFieldChain(fields, idx, snapshot = null) {
         if (idx >= fields.length) {
             if (this.config.randomDelayMin > this.config.randomDelayMax) {
                 this.widgets.output.setContent('\n{red-fg}Invalid jitter: min must be less than or equal to max{/red-fg}');
+                // Restore the snapshot so the invalid combination isn't persisted
+                // by a later unrelated saveConfig.
+                if (snapshot) {
+                    for (const [k, v] of Object.entries(snapshot)) {
+                        this.config[k] = v;
+                    }
+                }
                 this.widgets.menu.focus();
                 this.screen.render();
                 return;
             }
 
-            await saveConfig(this.config);
-            this.widgets.output.setContent(
-                '\n{green-fg}Delays updated and saved.{/green-fg}\n\n' +
-                this.getCurrentConfigDisplay()
-            );
+            try {
+                await saveConfig(this.config);
+                this.widgets.output.setContent(
+                    '\n{green-fg}Delays updated and saved.{/green-fg}\n\n' +
+                    this.getCurrentConfigDisplay()
+                );
+            } catch (err) {
+                // Persist failed — revert the in-memory values so a later
+                // unrelated saveConfig doesn't silently persist this abandoned edit.
+                if (snapshot) {
+                    for (const [k, v] of Object.entries(snapshot)) {
+                        this.config[k] = v;
+                    }
+                }
+                this.widgets.output.setContent(
+                    `\n{red-fg}Save failed — changes reverted: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`
+                );
+            }
+            // A global shortcut may have navigated away during the save await.
+            if (this._destroyed) return;
             this.widgets.menu.focus();
             this.screen.render();
             return;
@@ -168,17 +226,40 @@ export class ConfigScreen {
 
         const field = fields[idx];
         this.promptInput(`${field.label}:`, String(this.config[field.key]), async (val) => {
+            // Restore the snapshot on any abort so the live config isn't left
+            // half-mutated (a later unrelated saveConfig would persist it).
+            const restore = () => {
+                if (snapshot) {
+                    for (const [k, v] of Object.entries(snapshot)) {
+                        this.config[k] = v;
+                    }
+                }
+                this.widgets.menu.focus();
+                this.screen.render();
+            };
+            // Escape cancels the whole chain
+            if (val === null) {
+                restore();
+                return;
+            }
+            // Strict numeric check: reject partially-numeric input like "12abc"
+            if (!/^\d+$/.test(String(val).trim())) {
+                this.widgets.output.setContent(
+                    `\n{red-fg}Invalid value (must be ${field.min}–${field.max}){/red-fg}`
+                );
+                restore();
+                return;
+            }
             const num = parseInt(val, 10);
             if (isNaN(num) || num < field.min || num > field.max) {
                 this.widgets.output.setContent(
                     `\n{red-fg}Invalid value (must be ${field.min}–${field.max}){/red-fg}`
                 );
-                this.widgets.menu.focus();
-                this.screen.render();
+                restore();
                 return;
             }
             this.config[field.key] = num;
-            await this.editFieldChain(fields, idx + 1);
+            await this.editFieldChain(fields, idx + 1, snapshot);
         });
     }
 
@@ -208,11 +289,14 @@ export class ConfigScreen {
             this.config.downloadAttachments = (index === 0);
             try {
                 await saveConfig(this.config);
+                // A global shortcut may have navigated away during the await.
+                if (this._destroyed) return;
                 this.widgets.output.setContent(
                     '\n{green-fg}Download setting saved.{/green-fg}\n\n' +
                     this.getCurrentConfigDisplay()
                 );
             } catch (err) {
+                if (this._destroyed) return;
                 this.widgets.output.setContent(`\n{red-fg}Save failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
             }
             this.widgets.menu.focus();
@@ -239,11 +323,11 @@ export class ConfigScreen {
             mouse: true
         });
 
-        // Render first so dimensions are calculated, then set value & focus
-        this.screen.render();
-
+        // Set value & focus FIRST, then render — otherwise the default value
+        // stays invisible until the next paint (focus() alone does not paint).
         input.setValue(defaultVal);
         input.focus();
+        this.screen.render();
 
         // Handle submit (Enter) explicitly via key binding to ensure
         // it is consumed and does not propagate to screen-level handlers
@@ -258,14 +342,12 @@ export class ConfigScreen {
             });
         });
 
-        // Handle cancel (Escape) the same way
+        // Handle cancel (Escape): invoke callback(null) so field chains
+        // abort cleanly instead of silently leaving partially-edited values
         input.key('escape', () => {
             input.destroy();
             this.screen.render();
-            if (!this.widgets.menu.destroyed) {
-                this.widgets.menu.focus();
-            }
-            this.screen.render();
+            Promise.resolve(callback(null)).catch(() => {});
         });
     }
 
@@ -274,6 +356,8 @@ export class ConfigScreen {
     }
 
     destroy() {
+        this._destroyed = true;
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

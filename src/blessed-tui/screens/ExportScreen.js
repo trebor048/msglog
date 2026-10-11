@@ -1,5 +1,7 @@
 import blessed from 'blessed';
-import { Validator } from '../../utils/utils.js';
+import fs from 'fs';
+import path from 'path';
+import { TuiSpinner, Validator } from '../../utils/utils.js';
 
 const FORMAT_CONFIG = {
     json:   { label: 'JSON Export',     ext: '.json', exportFn: 'exportToJSON' },
@@ -21,6 +23,8 @@ export class ExportScreen {
         this.onBack = onBack;
         this.widgets = {};
         this.exporter = ctx.exporter;
+        this._destroyed = false;
+        this._resizeHandler = null;
 
         this.create();
         this.setupKeyBindings();
@@ -90,6 +94,13 @@ export class ExportScreen {
 
         this.widgets.menu.focus();
         this.widgets.menu.on('select', (item, index) => this.handleMenuSelect(index));
+
+        this._resizeHandler = () => {
+            this.widgets.menu.height = this.screen.height - 3;
+            this.widgets.status.height = this.screen.height - 3;
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
     }
 
     handleMenuSelect(index) {
@@ -116,10 +127,9 @@ export class ExportScreen {
             mouse: true
         });
 
-        this.screen.render();
-
         input.setValue(defaultName);
         input.focus();
+        this.screen.render();
 
         input.key('enter', async () => {
             const value = input.getValue() || defaultName;
@@ -162,10 +172,20 @@ export class ExportScreen {
     confirmExport(format, filename, outDir) {
         const cfg = FORMAT_CONFIG[format];
         const safeTarget = Validator.sanitizeBlessedTags(`${outDir}/${filename}`);
+        // A same-day re-export silently overwrites the previous file — surface
+        // that before the user confirms so nothing is lost by accident.
+        const exists = fs.existsSync(path.join(outDir, filename));
+        const items = [
+            `Export as ${cfg.label} to ${safeTarget}`,
+            ...(exists ? ['{yellow-fg}⚠ File already exists — it will be overwritten{/yellow-fg}'] : []),
+            '  Yes, proceed',
+            '  No, cancel'
+        ];
+        const yesIndex = items.length - 2;
         const dialog = blessed.list({
             parent: this.widgets.main,
             top: 'center', left: 'center',
-            width: '65%', height: 6,
+            width: '65%', height: items.length + 3,
             border: { type: 'line' },
             tags: true,
             label: ' Confirm Export ',
@@ -174,21 +194,23 @@ export class ExportScreen {
                 selected: { bg: 'blue', fg: 'white', bold: true },
                 item: { fg: 'white' }
             },
-            items: [
-                `Export as ${cfg.label} to ${safeTarget}`,
-                '  Yes, proceed',
-                '  No, cancel'
-            ]
+            items
         });
 
-        dialog.select(1);
+        // Default to the safe option — overwriting is not one ENTER away.
+        dialog.select(yesIndex + 1);
         dialog.focus();
         this.screen.render();
 
         dialog.on('select', (item, index) => {
             dialog.destroy();
-            if (index === 1) {
-                this.doExport(format, filename);
+            if (index === yesIndex) {
+                this.doExport(format, filename).catch(err => {
+                    // doExport has internal try/catch; this guards against the
+                    // async rejection path if a widget is destroyed mid-export
+                    const safeMsg = Validator.sanitizeErrorMessage(err);
+                    try { this.widgets.status.setContent(`\n{red-fg}Export failed: ${safeMsg}{/red-fg}`); } catch {}
+                });
             } else {
                 this.widgets.status.setContent('\n{gray-fg}Export cancelled{/gray-fg}');
                 this.widgets.menu.focus();
@@ -205,15 +227,22 @@ export class ExportScreen {
 
     async doExport(format, filename) {
         const cfg = FORMAT_CONFIG[format];
-        this.widgets.status.setContent(`\n{yellow-fg}Exporting ${cfg.label}...{/yellow-fg}`);
+        const spinner = new TuiSpinner(this.widgets.status, `Exporting ${cfg.label}...`);
+        spinner.start();
         this.screen.render();
 
         try {
             const exportFn = this.exporter[cfg.exportFn].bind(this.exporter);
             const result = await exportFn(filename);
+            // Always stop the spinner (also when the screen was destroyed
+            // mid-export) so its interval never keeps ticking.
+            spinner.stop(true);
+
+            // Screen may have been destroyed while the export ran (global shortcut)
+            if (this._destroyed) return;
 
             const filepath = result.filepath || result;
-            const count = result.count || 'N/A';
+            const count = result.count ?? 'N/A';
             const safeFilepath = Validator.sanitizeBlessedTags(String(filepath));
 
             this.widgets.status.setContent(
@@ -222,10 +251,13 @@ export class ExportScreen {
                 (format !== 'backup' ? ` Messages exported: {green-fg}${typeof count === 'number' ? count.toLocaleString() : count}{/green-fg}` : '')
             );
         } catch (err) {
+            spinner.stop(false);
+            if (this._destroyed) return;
             const msg = Validator.sanitizeErrorMessage(err);
             this.widgets.status.setContent(`\n{red-fg}Export failed: ${msg}{/red-fg}`);
         }
 
+        if (this._destroyed) return;
         this.widgets.menu.focus();
         this.screen.render();
     }
@@ -235,6 +267,8 @@ export class ExportScreen {
     }
 
     destroy() {
+        this._destroyed = true;
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
         if (this.widgets.main) this.widgets.main.destroy();
     }
 }

@@ -25,7 +25,11 @@ async function retryFetch(fn, attempts = 3, baseDelayMs = 800) {
 
             const retryAfter = err?.retryAfter ?? err?.timeout ?? 0;
             const delay = retryAfter > 0 ? retryAfter + 200 : baseDelayMs * Math.pow(2, i);
-            if (i < attempts - 1) await sleepJitter(delay);
+            if (i < attempts - 1) {
+                // retryAfter is a hard deadline — never jitter below it
+                if (retryAfter > 0) await sleep(delay);
+                else await sleepJitter(delay);
+            }
         }
     }
     throw lastErr;
@@ -109,8 +113,12 @@ export class SyncEngine {
         const maxPages = Math.max(1, Number(this.config.maxSyncPages ?? 100_000));
         const db        = this.messageStore.db;
 
-        // All Discord message fetches bypass the circuit breaker
-        const apiFetch = (opts) => retryFetch(() => channel.messages.fetch(opts), attempts, baseDelay);
+        // All Discord message fetches bypass the circuit breaker.
+        // cache:false keeps bulk syncs from ballooning discord.js's in-memory
+        // message cache — a multi-day catch-up can otherwise cache hundreds of
+        // thousands of Message objects (the config's maxCacheSize is not wired
+        // to the discord.js cache).
+        const apiFetch = (opts) => retryFetch(() => channel.messages.fetch(opts, { cache: false }), attempts, baseDelay);
         const log      = (msg) => this.jobManager.logToJob(jobId, msg);
 
         let totalMessages = 0;
@@ -121,11 +129,56 @@ export class SyncEngine {
         // to avoid a DB write on every single batch.
         const FLUSH_EVERY = 500;
         let pendingFlush = { oldest_id: null, newest_id: null, total: 0 };
+        // Run-wide cursor anchors. For forward/resume, newestAnchor tracks the
+        // walk frontier (updated every page so it can be persisted even when a
+        // run stores 0 new messages); oldestAnchor stays null. For
+        // backward/custom, oldestAnchor tracks the walk downward and newestAnchor
+        // is anchored once (the true newest of the channel).
+        let oldestAnchor = null;
+        let newestAnchor = null;
+        // When true, the first forward fetch pages from the Discord epoch snowflake
+        // so the channel's oldest message is included in the batch (after= is exclusive).
+        let useEpochAfter = false;
 
         try {
+            // Captured up-front (inside the try so a failure can't strand the
+            // job in 'running'): the forward cursor decision and the completion
+            // logic both need to know whether the channel has ANY stored rows.
+            const existingCount = this.messageStore.getMessageCount(channel.id);
+
             // ── Load stored cursor ───────────────────────────────────────────
             const syncState = db ? loadSyncState(db, channel.id) : null;
             let lastMessageId = null;
+
+            // Record the "starting point" — the DB entry (or anchor) that the
+            // job will start from — so the Live Monitor can show exactly where
+            // this job picks up, and log it once for the job log.
+            const recordStartingPoint = (label, msgId) => {
+                const row = msgId && typeof this.messageStore.getMessageById === 'function'
+                    ? this.messageStore.getMessageById(channel.id, msgId)
+                    : null;
+                let description;
+                if (row?.author_tag) {
+                    const when = row.timestamp ? new Date(row.timestamp).toLocaleString() : 'unknown time';
+                    const snippet = String(row.content || '').slice(0, 60);
+                    description = `${label} — ${row.author_tag} on ${when}${snippet ? `: "${snippet}"` : ''} (id ${row.id})`;
+                } else if (msgId) {
+                    description = `${label} (id ${msgId})`;
+                } else {
+                    description = label;
+                }
+                this.jobManager.setJobStartingPoint(jobId, { label, id: msgId ?? null, description });
+                log(`📍 Starting point: ${description}`);
+            };
+
+            // If channel was fully synced, backward/forward re-syncs should
+            // behave as resume (fetch only new messages). This MUST happen
+            // before the cursor is initialized below, otherwise the cursor
+            // would be seeded from the wrong direction.
+            if (syncState?.is_complete && (direction === 'backward' || direction === 'forward')) {
+                log('✅ Channel previously marked complete — redirecting to resume (new messages only)');
+                direction = 'resume';
+            }
 
             if (direction === 'resume') {
                 // Resume: fetch messages NEWER than our last known newest.
@@ -135,62 +188,52 @@ export class SyncEngine {
                     const when = syncState.last_synced_at
                         ? new Date(syncState.last_synced_at).toLocaleString()
                         : 'unknown';
-                    log(`📍 Resuming from stored cursor (last synced: ${when})`);
+                    recordStartingPoint(`Resume — from stored cursor (last synced: ${when})`, syncState.newest_id);
                 } else {
                     const row = this.messageStore.getMostRecentMessage(channel.id);
                     if (row) {
                         lastMessageId = row.id;
-                        log(`📍 Resuming from DB newest message (${new Date(row.timestamp).toLocaleString()})`);
+                        recordStartingPoint('Resume — from newest stored message', row.id);
                     } else {
-                        try {
-                            const seed = await apiFetch({ limit: 1 });
-                            lastMessageId = seed.first()?.id ?? null;
-                            log('📍 No prior sync state — starting resume from channel newest message');
-                        } catch (err) {
-                            log(`⚠️ Could not fetch seed message: ${err.message}`);
-                        }
+                        // No prior state and no DB rows — fetch from the channel's
+                        // newest. Do NOT seed the cursor with the newest message's
+                        // id: after= is exclusive, so that would skip it entirely.
+                        // Leaving lastMessageId null makes the first loop page a
+                        // plain newest-100 fetch, which includes the newest message.
+                        recordStartingPoint('Resume — no prior sync state, starting from channel newest', null);
+                        lastMessageId = null;
                     }
                 }
             } else if (direction === 'backward') {
-                // Backward: start from the channel's NEWEST message and page toward oldest.
-                // Uses before= to walk backward through history.
-                try {
-                    const seed = await apiFetch({ limit: 1 });
-                    lastMessageId = seed.first()?.id ?? null;
-                    if (lastMessageId) log(`📍 Starting backward sync from channel newest message`);
-                    else log('⚠️ Channel appears empty');
-                } catch (err) {
-                    log(`⚠️ Could not fetch seed message: ${err.message}`);
-                }
+                // Backward: start from the channel's NEWEST message and page toward
+                // oldest. Do NOT seed the cursor with the newest message's id:
+                // before= is exclusive, so that would skip the newest message. A
+                // null cursor makes the first page a newest-100 fetch.
+                recordStartingPoint('Backward sync — from channel newest message', null);
+                lastMessageId = null;
             } else if (direction === 'forward') {
                 // Forward: start from the OLDEST message already in DB (or channel start
                 // if nothing is stored yet) and page toward the newest.
-                // Uses before= but starts from the oldest stored cursor.
                 const oldestRow = this.messageStore.getOldestMessage(channel.id);
                 if (oldestRow?.id) {
                     lastMessageId = oldestRow.id;
-                    log(`📍 Starting forward sync from oldest DB message (${new Date(oldestRow.timestamp).toLocaleString()})`);
-                } else if (syncState?.oldest_id) {
+                    recordStartingPoint('Forward sync — from oldest stored message', oldestRow.id);
+                } else if (syncState?.oldest_id && existingCount > 0) {
                     lastMessageId = syncState.oldest_id;
-                    log(`📍 Starting forward sync from stored oldest cursor`);
+                    recordStartingPoint('Forward sync — from stored oldest cursor', syncState.oldest_id);
                 } else {
-                    // No data at all — fetch the oldest message in the channel
-                    // by fetching with no cursor (Discord gives newest), then we'll
-                    // naturally walk all the way back anyway.
-                    // Better: fetch the actual oldest by using after= on the very first
-                    // known snowflake (Discord epoch: 2015-01-01).
-                    const DISCORD_EPOCH_SNOWFLAKE = '0';
-                    try {
-                        const seed = await apiFetch({ limit: 1, after: DISCORD_EPOCH_SNOWFLAKE });
-                        lastMessageId = seed.first()?.id ?? null;
-                        if (lastMessageId) {
-                            log(`📍 Starting forward sync from channel's oldest message`);
-                        } else {
-                            log('⚠️ Channel appears empty');
-                        }
-                    } catch (err) {
-                        log(`⚠️ Could not fetch oldest message: ${err.message}`);
-                    }
+                    // No data at all (an empty DB means any stored oldest_id is
+                    // stale — it points at rows that no longer exist, and seeding
+                    // the walk with it would skip every message older than it).
+                    // Fetch the channel's oldest message instead. We must NOT use
+                    // the seed as the first loop cursor, because Discord's
+                    // `after=` is exclusive and would skip that seed message.
+                    // Instead leave the cursor null and let the first loop
+                    // iteration page from the epoch snowflake, so the oldest
+                    // message is stored too.
+                    recordStartingPoint('Forward sync — from channel start (no stored data)', null);
+                    lastMessageId = null;
+                    useEpochAfter = true;
                 }
             }
 
@@ -208,24 +251,39 @@ export class SyncEngine {
                         log('📍 Channel creation date unavailable — using Discord launch date (2015-05-13)');
                     }
                 } else {
-                    startMoment = moment(startDate);
+                    startMoment = moment(startDate).startOf('day');
                 }
-                endMoment = endDate === 'now' ? moment() : moment(endDate);
+                // Date-only end dates must be end-of-day so the final day's
+                // messages are included (the filter is end-inclusive).
+                endMoment = endDate === 'now' ? moment() : moment(endDate).endOf('day');
             }
 
             if (direction === 'custom' && (!startMoment?.isValid() || !endMoment?.isValid())) {
                 log('❌ Invalid date format — use YYYY-MM-DD or "start"/"now"');
+                this.jobManager.setJobError(jobId, 'Invalid date format — use YYYY-MM-DD or "start"/"now"');
                 this.jobManager.updateJobStatus(jobId, 'error');
                 return;
             }
 
+            if (direction === 'custom' && startMoment.isAfter(endMoment)) {
+                // An inverted range would silently page through the entire channel
+                // storing nothing (isBetween(start > end) matches nothing).
+                log('❌ Start date is after end date');
+                this.jobManager.setJobError(jobId, 'Start date is after end date');
+                this.jobManager.updateJobStatus(jobId, 'error');
+                return;
+            }
+
+            if (direction === 'custom') {
+                recordStartingPoint(
+                    `Custom date range ${startMoment.format('YYYY-MM-DD')} → ${endMoment.format('YYYY-MM-DD')}`,
+                    null
+                );
+            }
+
             // ── Pre-sync info ────────────────────────────────────────────────
-            const existingCount = this.messageStore.getMessageCount(channel.id);
             if (existingCount > 0) {
                 log(`📦 Channel already has ${existingCount.toLocaleString()} messages in DB`);
-            }
-            if (syncState?.is_complete) {
-                log('✅ Channel previously marked complete — fetching new messages only');
             }
 
             log(`🚀 ${direction} sync started for #${channel.name}`);
@@ -233,6 +291,7 @@ export class SyncEngine {
             // ── Main fetch loop ──────────────────────────────────────────────
             let pageCount = 0;
             let stoppedByPageLimit = false;
+            let warnedStoredRegion = false;
 
             while (true) {
                 if (++pageCount > maxPages) {
@@ -255,7 +314,17 @@ export class SyncEngine {
                 }
                 if (isPausedFn?.()) {
                     log('⏸️ Paused — waiting...');
-                    while (isPausedFn?.() && !isShutdownRequested() && !this.jobManager.isCancelRequested(jobId)) await sleep(2000);
+                    const pausedAt = Date.now();
+                    const MAX_PAUSE_MS = 600_000; // 10 minute max pause
+                    while (isPausedFn?.() && !isShutdownRequested() && !this.jobManager.isCancelRequested(jobId)) {
+                        if (Date.now() - pausedAt > MAX_PAUSE_MS) {
+                            log('⏸️ Pause timeout reached — stopping job');
+                            this.jobManager.setJobError(jobId, 'Paused for too long');
+                            this.jobManager.updateJobStatus(jobId, 'error', totalMessages);
+                            return;
+                        }
+                        await sleep(2000);
+                    }
                     if (this.jobManager.isCancelRequested(jobId)) {
                         log('🛑 Cancellation requested — stopping job');
                         this.jobManager.setJobError(jobId, 'Cancelled by user');
@@ -272,7 +341,7 @@ export class SyncEngine {
                     lastHeartbeat = Date.now();
                 }
 
-                await this.rateLimiter.wait(channel.id);
+                await this.rateLimiter.wait(channel.id, { fast: true });
 
                 // Build fetch options
                 // Discord always returns messages newest-first within a batch.
@@ -284,7 +353,13 @@ export class SyncEngine {
                 //   'custom'   → before= : start from newest, walk toward oldest, filtered by date
                 const fetchOpts = { limit: 100 };
                 if (direction === 'resume' || direction === 'forward') {
-                    if (lastMessageId) fetchOpts.after = lastMessageId;
+                    if (useEpochAfter) {
+                        const DISCORD_EPOCH_SNOWFLAKE = '4194304';
+                        fetchOpts.after = DISCORD_EPOCH_SNOWFLAKE;
+                        useEpochAfter = false;
+                    } else if (lastMessageId) {
+                        fetchOpts.after = lastMessageId;
+                    }
                 } else if (lastMessageId) {
                     fetchOpts.before = lastMessageId;
                 }
@@ -302,6 +377,16 @@ export class SyncEngine {
 
                 if (!messages.size) break; // no more messages — done
 
+                // Re-check cancellation after the fetch (before the store, which
+                // can be slow with attachment/embed downloads) so a cancel stops
+                // promptly instead of finishing the whole batch first.
+                if (this.jobManager.isCancelRequested(jobId)) {
+                    log('🛑 Cancellation requested — stopping job');
+                    this.jobManager.setJobError(jobId, 'Cancelled by user');
+                    this.jobManager.updateJobStatus(jobId, 'error', totalMessages);
+                    return;
+                }
+
                 let batch = [...messages.values()];
 
                 // Date range filter + stop condition for custom syncs.
@@ -317,15 +402,42 @@ export class SyncEngine {
                     batch = batch.filter(m => moment(m.createdAt).isBetween(startMoment, endMoment, null, '[]'));
                 }
 
-                // Advance cursor based on direction:
-                //   resume/forward (after=): Discord returns oldest-first when using after=,
-                //     so .last() is the newest message — use that as next cursor.
-                //   backward/custom (before=): Discord returns newest-first when using before=,
-                //     so .last() is the oldest message — use that as next cursor.
+                // Advance cursor based on direction.
                 //
-                // Note: discord.js-selfbot-v13 Collection with after= returns ascending order
-                // (oldest first), while before= returns descending order (newest first).
-                lastMessageId = messages.last().id;
+                // Discord's REST API ALWAYS returns message batches newest-first
+                // (sorted by snowflake id descending), regardless of before= or
+                // after=. discord.js-selfbot-v13's fetch() builds the Collection in
+                // that exact API order, so:
+                //   .first() = NEWEST message of the batch
+                //   .last()  = OLDEST message of the batch
+                //
+                //   resume/forward (after=): the next page must continue AFTER the
+                //     newest message we just fetched → cursor = .first().id
+                //     (using .last() here re-fetches ~99 already-seen messages per
+                //     page — the old "1 new, 99 skip" crawl).
+                //   backward/custom (before=): the next page must continue BEFORE
+                //     the oldest message we just fetched → cursor = .last().id
+                const batchNewest = messages.first()?.id ?? null;
+                const batchOldest = messages.last()?.id ?? null;
+                const prevCursor  = lastMessageId;
+                lastMessageId = (direction === 'resume' || direction === 'forward')
+                    ? batchNewest
+                    : batchOldest;
+
+                // Safety net: a batch that does not advance the cursor (the API
+                // returned the same window again, or messages without usable
+                // ids) would make this loop spin until maxSyncPages. Treat it
+                // like an empty page and stop.
+                if (!lastMessageId || lastMessageId === prevCursor) {
+                    log('⚠️ Fetch cursor did not advance — stopping pagination');
+                    break;
+                }
+
+                // Track the walk frontier so the cursor can be persisted even when
+                // a run stores 0 new messages (already fully caught up).
+                if (direction === 'resume' || direction === 'forward') {
+                    if (batchNewest) newestAnchor = batchNewest;
+                }
 
                 if (!batch.length) continue;
 
@@ -335,10 +447,14 @@ export class SyncEngine {
                 const newMsgs  = batch.filter(m => !existing.has(m.id));
 
                 if (newMsgs.length === 0) {
-                    // All already stored — on resume/forward this means we've caught up
-                    if (direction === 'resume' || direction === 'forward') {
-                        log('✅ Caught up — all messages already in DB');
-                        break;
+                    // All already stored. Do NOT stop here: a stored block right
+                    // after the cursor proves nothing about newer messages, and a
+                    // gap further up (listener on/off periods) would be silently
+                    // missed forever. Keep paging until the channel's actual
+                    // newest is reached (empty page). Pages are cheap (100 msgs).
+                    if (!warnedStoredRegion) {
+                        log('ℹ️ Skipping already-stored region — paging through to check for gaps');
+                        warnedStoredRegion = true;
                     }
                     continue;
                 }
@@ -347,12 +463,9 @@ export class SyncEngine {
                     log(`⏭️ ${batch.length - newMsgs.length} already in DB, storing ${newMsgs.length} new`);
                 }
 
-                // Store in chronological order (oldest first) for all directions.
-                // after= (resume/forward) returns ascending — already oldest-first.
-                // before= (backward/custom) returns descending — needs reverse.
-                const toStore = (direction === 'backward' || direction === 'custom')
-                    ? [...newMsgs].reverse()
-                    : newMsgs;
+                // Store in chronological order (oldest first) for ALL directions.
+                // The API always returns newest-first, so reverse every batch.
+                const toStore = [...newMsgs].reverse();
                 await this.messageStore.storeMessagesBatch(
                     toStore, channel, withRetry,
                     this.downloadAttachmentFn, this.processEmbedsFn, isShutdownRequested
@@ -370,21 +483,32 @@ export class SyncEngine {
                 const oldestInBatch = toStore[0];
                 const newestInBatch = toStore[toStore.length - 1];
                 if (direction === 'resume' || direction === 'forward') {
-                    pendingFlush.newest_id = newestInBatch?.id ?? null;
-                    if (!pendingFlush.oldest_id) pendingFlush.oldest_id = oldestInBatch?.id ?? null;
+                    // Forward/resume walks oldest→newest. newestAnchor was already
+                    // set to the batch frontier above (the newest message of the
+                    // window, which is in the DB either way). Never write
+                    // oldest_id: it's the backward cursor (true oldest fetched),
+                    // which only backward/custom syncs should set.
+                    pendingFlush.oldest_id = null;
+                    pendingFlush.newest_id = newestAnchor;
                 } else {
-                    pendingFlush.oldest_id = oldestInBatch?.id ?? null;
-                    if (!pendingFlush.newest_id) pendingFlush.newest_id = newestInBatch?.id ?? null;
+                    // Backward/custom walks newest→oldest. Anchor the newest once
+                    // (the true newest of the channel) and keep updating oldest.
+                    oldestAnchor = oldestInBatch?.id ?? null;
+                    if (!newestAnchor) newestAnchor = newestInBatch?.id ?? null;
+                    pendingFlush.oldest_id = oldestAnchor;
+                    pendingFlush.newest_id = newestAnchor;
                 }
                 pendingFlush.total += newMsgs.length;
 
                 // Flush cursor to DB every FLUSH_EVERY messages
                 if (pendingFlush.total >= FLUSH_EVERY && db) {
-                    const oldest = new Date(oldestInBatch.createdTimestamp).toLocaleDateString();
-                    log(`📊 ${totalMessages.toLocaleString()} stored — reached ${oldest}`);
+                    const frontier = (direction === 'resume' || direction === 'forward')
+                        ? new Date(newestInBatch.createdTimestamp).toLocaleDateString()
+                        : new Date(oldestInBatch.createdTimestamp).toLocaleDateString();
+                    log(`📊 ${totalMessages.toLocaleString()} stored — now at ${frontier}`);
                     flushSyncState(db, channel.id, {
-                        oldest_id: pendingFlush.oldest_id,
-                        newest_id: pendingFlush.newest_id,
+                        oldest_id: oldestAnchor,
+                        newest_id: newestAnchor,
                         total_fetched: pendingFlush.total
                     });
                     pendingFlush = { oldest_id: null, newest_id: null, total: 0 };
@@ -393,10 +517,15 @@ export class SyncEngine {
             }
 
             // ── Final cursor flush ───────────────────────────────────────────
-            if (db && pendingFlush.total > 0) {
+            // Also persist the advanced resume/forward frontier when a run stored
+            // 0 new messages (already caught up) so the next resume starts from
+            // the true newest instead of re-walking the same windows.
+            const shouldFlushCursor = pendingFlush.total > 0 ||
+                ((direction === 'resume' || direction === 'forward') && newestAnchor);
+            if (db && shouldFlushCursor) {
                 flushSyncState(db, channel.id, {
-                    oldest_id: pendingFlush.oldest_id,
-                    newest_id: pendingFlush.newest_id,
+                    oldest_id: oldestAnchor,
+                    newest_id: newestAnchor,
                     total_fetched: pendingFlush.total
                 });
             }
@@ -413,8 +542,14 @@ export class SyncEngine {
             log(`✅ Done — ${totalMessages.toLocaleString()} new messages from #${channel.name}`);
             this.jobManager.updateJobStatus(jobId, 'completed', totalMessages);
 
-            // Mark complete only for full backward/forward syncs (not resume or custom)
-            if (db && (direction === 'backward' || direction === 'forward')) {
+            // Mark complete only for syncs that genuinely reached the channel's
+            // oldest message:
+            //   - backward: seeds from newest and pages to the true oldest.
+            //   - forward:  only if the DB was empty beforehand (starts from the
+            //     channel's actual oldest via the epoch seed). A forward sync on a
+            //     partially-populated DB starts from the oldest STORED message, so
+            //     older history may still be missing — do NOT mark it complete.
+            if (db && (direction === 'backward' || (direction === 'forward' && existingCount === 0))) {
                 markChannelComplete(db, channel.id);
                 log('📌 Channel marked as fully synced');
             }
@@ -461,10 +596,15 @@ export class SyncEngine {
 
         available.forEach(ch => {
             const job = this.jobManager.createJob(ch, 'resume', null, null);
+            if (!job) return;
             this.syncChannelMessages(ch, 'resume', null, null, job.id, withRetry, isShutdownRequested, isPausedFn)
                 .catch(err => {
                     this.jobManager.logToJob(job.id, `❌ Unhandled: ${err.message}`);
                     this.jobManager.updateJobStatus(job.id, 'error');
+                    if (this.performance) {
+                        this.performance.stats.totalErrors++;
+                        this.performance.stats.lastError = { message: err.message, timestamp: new Date().toISOString() };
+                    }
                 });
         });
     }

@@ -9,6 +9,15 @@ const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const ATTACHMENTS_COUNT_EXPR = `CASE WHEN json_valid(attachments) THEN json_array_length(attachments) ELSE 0 END`;
 const REACTIONS_COUNT_EXPR = `CASE WHEN json_valid(reactions) THEN json_array_length(reactions) ELSE 0 END`;
 
+// Search limits feed SQLite's LIMIT clause directly. A negative value means
+// "no limit" in SQLite (LIMIT -1 returns the whole table), so clamp every
+// caller-supplied limit into a safe range. 0/NaN/undefined keep the default.
+function clampSearchLimit(limit) {
+    const num = Number(limit);
+    const safe = Number.isFinite(num) && num > 0 ? num : 100;
+    return Math.max(1, Math.min(safe, 10000));
+}
+
 function normalizeStartDateInput(value) {
     if (typeof value !== 'string') return value;
     const trimmed = value.trim();
@@ -29,7 +38,9 @@ function normalizeEndDateInput(value) {
 
 export function escapeCsvCell(value) {
     const text = String(value ?? '');
-    const formulaSafe = /^[=+\-@]/.test(text) ? `'${text}` : text;
+    // OWASP: neutralize leading = + - @ AND tab/CR, which some spreadsheets
+    // trim before evaluating a formula.
+    const formulaSafe = /^[\t\r=+\-@]/.test(text) ? `'${text}` : text;
     return `"${formulaSafe.replace(/"/g, '""')}"`;
 }
 
@@ -114,13 +125,20 @@ export class MessageSearch {
 
         const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
         const sql = `SELECT * FROM messages ${whereClause} ORDER BY timestamp DESC LIMIT ?`;
-        params.push(filters.limit || 100);
+        params.push(clampSearchLimit(filters.limit));
 
         return { sql, params };
     }
 
     _getPreparedStatement(sql) {
         if (!this.preparedStatements.has(sql)) {
+            // Cap cache to prevent unbounded growth from dynamic search queries.
+            // Note: better-sqlite3 has no Statement.finalize() — evicted
+            // statements are released by GC and by db.close().
+            if (this.preparedStatements.size >= 500) {
+                const firstKey = this.preparedStatements.keys().next().value;
+                this.preparedStatements.delete(firstKey);
+            }
             this.preparedStatements.set(sql, this.db.prepare(sql));
         }
         return this.preparedStatements.get(sql);
@@ -155,7 +173,11 @@ export class MessageSearch {
             if (this.performance) this.performance.stats.totalSearches++;
             return results;
         } catch (err) {
-            if (mergedFilters.query && this.ftsEnabled) {
+            // Only permanently downgrade to LIKE when the FTS table is genuinely
+            // unavailable or corrupted. Other errors (bad query syntax, etc.)
+            // should NOT disable FTS for all future searches.
+            if (mergedFilters.query && this.ftsEnabled &&
+                /no such table|does not exist|malformed|disk image/i.test(err?.message ?? '')) {
                 this.ftsEnabled = false;
             }
             // FTS may not exist on older DBs — fall back to LIKE search
@@ -198,7 +220,34 @@ export class MessageSearch {
             params.push(normalizedEndDate);
         }
 
-        params.push(filters.limit || 100);
+        // Mirror the LIKE-path filters so FTS and LIKE searches behave identically
+        if (filters.messageType === 'text') {
+            extraConditions.push(`${ATTACHMENTS_COUNT_EXPR} = 0`);
+        } else if (filters.messageType === 'media') {
+            extraConditions.push(`${ATTACHMENTS_COUNT_EXPR} > 0`);
+        }
+        if (filters.hasAttachments === true) {
+            extraConditions.push(`${ATTACHMENTS_COUNT_EXPR} > 0`);
+        } else if (filters.hasAttachments === false) {
+            extraConditions.push(`${ATTACHMENTS_COUNT_EXPR} = 0`);
+        }
+        if (filters.hasReactions === true) {
+            extraConditions.push(`${REACTIONS_COUNT_EXPR} > 0`);
+        } else if (filters.hasReactions === false) {
+            extraConditions.push(`${REACTIONS_COUNT_EXPR} = 0`);
+        }
+        if (filters.isEdited === true) {
+            extraConditions.push('m.edited_at IS NOT NULL');
+        } else if (filters.isEdited === false) {
+            extraConditions.push('m.edited_at IS NULL');
+        }
+        if (filters.isBot === false) {
+            extraConditions.push('m.is_bot = 0');
+        } else if (filters.isBot === true) {
+            extraConditions.push('m.is_bot = 1');
+        }
+
+        params.push(clampSearchLimit(filters.limit));
 
         const where = extraConditions.length
             ? `AND ${extraConditions.join(' AND ')}`
@@ -215,7 +264,8 @@ export class MessageSearch {
             LIMIT ?
         `;
 
-        const results = this.db.prepare(sql).all(...params);
+        const stmt = this._getPreparedStatement(sql);
+        const results = stmt.all(...params);
         if (this.performance) this.performance.stats.totalSearches++;
         return results;
     }
@@ -278,16 +328,18 @@ export class MessageSearch {
     getMessagesByDate(startDate, endDate, channelId = null) {
         // Dynamic SQL - can't cache prepared statement due to conditional WHERE clause
         // This is called infrequently so acceptable
+        const normalizedStart = normalizeStartDateInput(startDate);
+        const normalizedEnd = normalizeEndDateInput(endDate);
         let sql = `
             SELECT 
                 DATE(timestamp) as date,
                 COUNT(*) as count,
                 COUNT(DISTINCT author_id) as unique_authors
             FROM messages
-            WHERE timestamp >= ? AND timestamp <= ?
+            WHERE deleted = 0 AND timestamp >= ? AND timestamp <= ?
         `;
 
-        const params = [startDate, endDate];
+        const params = [normalizedStart, normalizedEnd];
 
         if (channelId) {
             sql += ` AND channel_id = ?`;
@@ -298,8 +350,7 @@ export class MessageSearch {
                  ORDER BY date ASC`;
 
         const stmt = this.db.prepare(sql);
-        const result = stmt.all(...params);
-        return result;
+        return stmt.all(...params);
     }
 
     findDuplicates(channelId = null) {
@@ -307,10 +358,10 @@ export class MessageSearch {
         // This is called infrequently so acceptable
         let sql = `
             SELECT 
-                m1.id, m1.author_tag, m1.content, m1.timestamp,
+                MIN(m1.id) as id, m1.author_tag, m1.content, m1.timestamp,
                 COUNT(*) as duplicate_count
             FROM messages m1
-            WHERE m1.deleted = 0
+            WHERE m1.deleted = 0 AND LENGTH(m1.content) > 0
         `;
 
         const params = [];
@@ -324,12 +375,11 @@ export class MessageSearch {
             GROUP BY m1.content, m1.author_id
             HAVING COUNT(*) > 1
             ORDER BY duplicate_count DESC
+            LIMIT 100
         `;
 
         const stmt = this.db.prepare(sql);
-        const result = stmt.all(...params);
-
-        return result;
+        return stmt.all(...params);
     }
 }
 
@@ -342,9 +392,7 @@ export class MessageExporter {
 
     async exportToJSON(filename, filters = {}) {
         try {
-            const sql = this._buildFilteredQuery(filters);
-            const stmt = this.db.prepare(sql);
-            const messages = stmt.all(...this._getFilterParams(filters));
+            const messages = this._runFilteredQuery(filters);
 
             const data = {
                 exportDate: new Date().toISOString(),
@@ -377,9 +425,7 @@ export class MessageExporter {
 
     async exportToCSV(filename, filters = {}) {
         try {
-            const sql = this._buildFilteredQuery(filters);
-            const stmt = this.db.prepare(sql);
-            const messages = stmt.all(...this._getFilterParams(filters));
+            const messages = this._runFilteredQuery(filters);
 
 
             const headers = ['ID', 'Author', 'Content', 'Timestamp', 'Channel', 'Attachments', 'Reactions', 'Edited', 'Deleted'];
@@ -416,9 +462,7 @@ export class MessageExporter {
 
     async exportToHTML(filename, filters = {}) {
         try {
-            const sql = this._buildFilteredQuery(filters);
-            const stmt = this.db.prepare(sql);
-            const messages = stmt.all(...this._getFilterParams(filters));
+            const messages = this._runFilteredQuery(filters);
 
 
             const html = `
@@ -490,9 +534,23 @@ export class MessageExporter {
 
             await fs.mkdir('backups', { recursive: true });
 
-            // VACUUM INTO creates a consistent snapshot without long-lived locks
-            const stmt = this.db.prepare(`VACUUM INTO ?`);
-            stmt.run(backupPath);
+            // Remove any pre-existing destination so both the native backup API
+            // and VACUUM INTO never collide with a stale file from an earlier run.
+            try { await fs.unlink(backupPath); } catch {}
+
+            // Use native backup API (non-blocking reads) when available;
+            // falls back to VACUUM INTO for older better-sqlite3 versions.
+            // VACUUM INTO requires a string literal, not a bound parameter.
+            if (typeof this.db.backup === 'function') {
+                console.log(chalk.blue('💾 Creating database backup...'));
+                await this.db.backup(backupPath);
+            } else {
+                console.log(chalk.yellow('⚠️ Using VACUUM INTO for backup (may briefly block writes)'));
+                // backupPath is already sanitized/confined via _resolveOutputPath
+                const escapedPath = backupPath.replace(/'/g, "''");
+                this.db.exec(`VACUUM INTO '${escapedPath}'`);
+            }
+
             const info = await fs.stat(backupPath);
             if (!info.isFile() || info.size === 0) {
                 throw new Error('Backup file verification failed');
@@ -518,10 +576,11 @@ export class MessageExporter {
         if (filters.hasAttachments === true) sql += ` AND ${ATTACHMENTS_COUNT_EXPR} > 0`;
         if (filters.hasAttachments === false) sql += ` AND ${ATTACHMENTS_COUNT_EXPR} = 0`;
         if (filters.isBot === false) sql += ' AND is_bot = 0';
+        else if (filters.isBot === true) sql += ' AND is_bot = 1';
 
         sql += ' ORDER BY timestamp DESC';
 
-        const limit = filters.limit || 10_000;
+        const limit = Number(filters.limit) || 10_000;
         sql += ` LIMIT ${Math.max(1, Math.min(limit, 100_000))}`;
         return sql;
     }
@@ -537,6 +596,14 @@ export class MessageExporter {
         if (normalizedStartDate && filters.startDate) params.push(normalizedStartDate);
         if (normalizedEndDate && filters.endDate) params.push(normalizedEndDate);
         return params;
+    }
+
+    // Export SQL is rebuilt per call (conditional WHERE), so this helper keeps
+    // the prepare+run in one place. Statements need no manual finalization:
+    // better-sqlite3 releases them on GC and on db.close().
+    _runFilteredQuery(filters) {
+        const stmt = this.db.prepare(this._buildFilteredQuery(filters));
+        return stmt.all(...this._getFilterParams(filters));
     }
 
     _escapeHTML(text) {
@@ -762,8 +829,10 @@ export class DatabaseManager {
     optimize() {
         try {
             console.log(chalk.blue('🔧 Optimizing database...'));
+            console.log(chalk.yellow('   VACUUM requires an exclusive lock — avoid during active sync'));
             this.db.exec('VACUUM');
             this.db.exec('ANALYZE');
+            this.db.exec('PRAGMA optimize');
             console.log(chalk.green('✅ Database optimized'));
             return true;
         } catch (err) {
@@ -835,13 +904,15 @@ export class DatabaseManager {
             const info = {};
 
             for (const table of tables) {
-                // Dynamic SQL for table-specific queries - can't cache
-                const countStmt = this.db.prepare(`SELECT COUNT(*) as count FROM "${table.name}"`);
-                const count = countStmt.get();
-                
-                const columnsStmt = this.db.prepare(`PRAGMA table_info("${table.name}")`);
-                const columns = columnsStmt.all();
-                
+                // Identifiers are quoted; escape any embedded double-quotes so a
+                // crafted sqlite_master entry can't break out of the literal.
+                // Statements need no manual finalization: better-sqlite3 releases
+                // them on GC and on db.close() (Statement has no finalize()).
+                const safeName = String(table.name).replace(/"/g, '""');
+                const count = this.db.prepare(`SELECT COUNT(*) as count FROM "${safeName}"`).get();
+
+                const columns = this.db.prepare(`PRAGMA table_info("${safeName}")`).all();
+
                 info[table.name] = {
                     rowCount: count.count,
                     columns: columns.map(c => ({ name: c.name, type: c.type }))
@@ -886,7 +957,18 @@ export class DatabaseManager {
         }
         try {
             console.log(chalk.blue('🔍 Rebuilding FTS index...'));
-            this.db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`);
+            const txn = this.db.transaction(() => {
+                // delete-all + re-insert only non-deleted rows so soft-deleted
+                // messages stay out of the index (the 'rebuild' command would
+                // re-index every base-table row including deleted ones).
+                this.db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('delete-all')`);
+                this.db.exec(`
+                    INSERT INTO messages_fts(rowid, content, author_tag)
+                    SELECT rowid, COALESCE(content, ''), COALESCE(author_tag, '')
+                    FROM messages WHERE deleted = 0
+                `);
+            });
+            txn();
             const count = this.db.prepare('SELECT COUNT(*) as n FROM messages_fts').get().n;
             console.log(chalk.green(`✅ FTS index rebuilt (${count.toLocaleString()} rows)`));
             return { success: true, count };
@@ -903,6 +985,11 @@ export class DatabaseManager {
             const countBeforeStmt = this.db.prepare('SELECT COUNT(*) as count FROM messages');
             const countBefore = countBeforeStmt.get().count;
 
+            if (countBefore > 100_000) {
+                console.log(chalk.yellow(`⚠️ Large database (${countBefore.toLocaleString()} rows) — dedup may take a while and block writes`));
+                console.log(chalk.yellow('   Avoid running dedup during active sync jobs'));
+            }
+
             const txn = this.db.transaction(() => {
                 this.db.exec(`
                     DELETE FROM messages
@@ -917,7 +1004,6 @@ export class DatabaseManager {
             const countAfter = countAfterStmt.get().count;
 
             const removed = countBefore - countAfter;
-
             console.log(chalk.green(`✅ Deduplication complete: ${countBefore} → ${countAfter} messages (removed ${removed})`));
 
             this.optimize();

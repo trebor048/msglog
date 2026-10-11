@@ -11,6 +11,8 @@ export class ChannelScreen {
         this.ctx = ctx;
         this.onBack = onBack;
         this.widgets = {};
+        this._activePrompt = null;
+        this._resizeHandler = null;
 
         this.create();
     }
@@ -39,10 +41,19 @@ export class ChannelScreen {
             content: ' UP/DOWN Navigate  ENTER Select  ? Help  ESC/Q Back'
         });
 
+        this._resizeHandler = () => {
+            if (this.widgets.list && !this.widgets.list.destroyed) {
+                this.widgets.list.height = this.screen.height - 3;
+            }
+            this.screen.render();
+        };
+        this.screen.on('resize', this._resizeHandler);
+
         this.showGuildList();
     }
 
     showGuildList() {
+        this._destroyActivePrompt();
         if (this.widgets.list) this.widgets.list.destroy();
 
         // Header is plain text — no tags
@@ -94,6 +105,7 @@ export class ChannelScreen {
     }
 
     showChannelList(guild) {
+        this._destroyActivePrompt();
         if (this.widgets.list) this.widgets.list.destroy();
 
         // Header is plain text — no tags
@@ -176,6 +188,7 @@ export class ChannelScreen {
     }
 
     showFetchOptions(channel) {
+        this._destroyActivePrompt();
         if (this.widgets.list) this.widgets.list.destroy();
 
         const isListening = this.ctx.listeningChannels.has(channel.id);
@@ -292,6 +305,7 @@ export class ChannelScreen {
     }
 
     promptPersistence(callback) {
+        this._destroyActivePrompt();
         const question = blessed.question({
             parent: this.widgets.main,
             top: 'center', left: 'center',
@@ -301,8 +315,13 @@ export class ChannelScreen {
             label: ' Persistence ',
             tags: true
         });
+        this._activePrompt = question;
 
         question.ask('Should this selection persist across restarts?', (err, value) => {
+            // blessed hides the question on completion but does NOT destroy it —
+            // destroy explicitly to avoid a per-prompt widget leak.
+            try { question.destroy(); } catch {}
+            this._activePrompt = null;
             if (value) {
                 callback(true);
             } else {
@@ -313,22 +332,35 @@ export class ChannelScreen {
 
     startFetchJob(channel, direction) {
         const job = this.ctx.jobManager.createJob(channel, direction, null, null);
+        if (!job) {
+            // createJob refuses duplicates — a job for this channel is already running
+            this.showMessage(
+                '{yellow-fg}Channel already has an active job{/yellow-fg}',
+                () => this.showFetchOptions(channel)
+            );
+            return;
+        }
         this.ctx.syncEngine.syncChannelMessages(
             channel, direction, null, null, job.id,
             this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
-        );
+        ).catch(err => {
+            // Guard against rejections escaping the sync engine's internal try/catch
+            this.ctx.jobManager.logToJob(job.id, `❌ Unhandled: ${err?.message ?? err}`);
+            this.ctx.jobManager.updateJobStatus(job.id, 'error');
+        });
         const desc = direction === 'forward'
             ? 'Oldest → Newest'
             : direction === 'backward'
             ? 'Newest → Oldest'
             : 'Resuming from last sync';
         this.showMessage(
-            `{green-fg}Job #${job.id} started!{/green-fg}\n ${Validator.sanitizeBlessedTags(desc)} on #${Validator.sanitizeBlessedTags(channel.name)}`,
+            `{green-fg}Job #${job.id} started!{/green-fg}\n ${Validator.sanitizeBlessedTags(desc)} on #${Validator.sanitizeBlessedTags(channel.name)}\n\n{gray-fg}Open the Live Monitor (Ctrl+L) — it will jump straight to this job and show where it starts from.{/gray-fg}`,
             () => this.onBack()
         );
     }
 
     promptCustomDates(channel) {
+        this._destroyActivePrompt();
         const input = blessed.textbox({
             parent: this.widgets.main,
             top: 'center', left: 'center',
@@ -340,15 +372,16 @@ export class ChannelScreen {
             keys: true,
             mouse: true
         });
-
-        this.screen.render();
+        this._activePrompt = input;
 
         input.setValue('start');
         input.focus();
+        this.screen.render();
 
         input.key('enter', () => {
             const startDate = input.getValue();
             input.destroy();
+            this._activePrompt = null;
             this.screen.render();
             if (!startDate) { this.showFetchOptions(channel); return; }
 
@@ -363,29 +396,43 @@ export class ChannelScreen {
                 keys: true,
                 mouse: true
             });
+            this._activePrompt = input2;
 
-            this.screen.render();
             input2.setValue('now');
             input2.focus();
+            this.screen.render();
 
             input2.key('enter', () => {
                 const endDate = input2.getValue();
                 input2.destroy();
+                this._activePrompt = null;
                 this.screen.render();
                 if (!endDate) { this.showFetchOptions(channel); return; }
+                // Re-check: autoSync may have started a job while the user typed dates
                 const job = this.ctx.jobManager.createJob(channel, 'custom', startDate.trim(), endDate.trim());
+                if (!job) {
+                    this.showMessage(
+                        '{yellow-fg}Channel already has an active job{/yellow-fg}',
+                        () => this.showFetchOptions(channel)
+                    );
+                    return;
+                }
                 this.ctx.syncEngine.syncChannelMessages(
                     channel, 'custom', startDate.trim(), endDate.trim(), job.id,
                     this.ctx.withRetry, () => this.ctx.isShuttingDown, () => this.ctx.isPaused
-                );
+                ).catch(err => {
+                    this.ctx.jobManager.logToJob(job.id, `❌ Unhandled: ${err?.message ?? err}`);
+                    this.ctx.jobManager.updateJobStatus(job.id, 'error');
+                });
                 this.showMessage(
-                    `{green-fg}Custom job #${job.id} started!{/green-fg}\n From ${Validator.sanitizeBlessedTags(startDate.trim())} to ${Validator.sanitizeBlessedTags(endDate.trim())}`,
+                    `{green-fg}Custom job #${job.id} started!{/green-fg}\n From ${Validator.sanitizeBlessedTags(startDate.trim())} to ${Validator.sanitizeBlessedTags(endDate.trim())}\n\n{gray-fg}Open the Live Monitor (Ctrl+L) — it will jump straight to this job.{/gray-fg}`,
                     () => this.onBack()
                 );
             });
 
             input2.key('escape', () => {
                 input2.destroy();
+                this._activePrompt = null;
                 this.screen.render();
                 this.showFetchOptions(channel);
             });
@@ -393,6 +440,7 @@ export class ChannelScreen {
 
         input.key('escape', () => {
             input.destroy();
+            this._activePrompt = null;
             this.screen.render();
             this.showFetchOptions(channel);
         });
@@ -407,6 +455,9 @@ export class ChannelScreen {
         c += ` Status:   {bold}${job.status}{/bold}\n`;
         c += ` Progress: {green-fg}${job.totalMessages}{/green-fg} messages\n`;
         c += ` Duration: {white-fg}${formatDuration(Date.now() - job.startTime)}{/white-fg}\n`;
+        if (job.startingPoint?.description) {
+            c += ` Starting: {cyan-fg}${Validator.sanitizeBlessedTags(job.startingPoint.description).slice(0, 80)}{/cyan-fg}\n`;
+        }
 
         if (job.logs && job.logs.length) {
             c += `\n{cyan-fg}Recent Logs:{/cyan-fg}\n`;
@@ -454,8 +505,17 @@ export class ChannelScreen {
     }
 
     destroy() {
+        if (this._resizeHandler) this.screen.removeListener('resize', this._resizeHandler);
+        this._destroyActivePrompt();
         if (this.widgets.list) this.widgets.list.destroy();
         if (this.widgets.main) this.widgets.main.destroy();
+    }
+
+    _destroyActivePrompt() {
+        if (this._activePrompt) {
+            try { this._activePrompt.destroy(); } catch {}
+            this._activePrompt = null;
+        }
     }
 }
 

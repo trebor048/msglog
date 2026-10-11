@@ -7,12 +7,14 @@ import chalk from 'chalk';
 const defaultConfig = {
     databaseFile: './messages.db',
     globalDelay: 1500,
+    syncRequestDelayMs: 300,
     maxFastRequests: 10,
     maxRateLimitChannels: 10000,
     maxSyncPages: 100000,
     randomDelayMin: 1000,
     randomDelayMax: 2500,
     maxEventQueueSize: 2000,
+    maxQueueWorkers: 2,
     deletedRetentionDays: 30,
     downloadAttachments: false,
     downloadTimeoutSeconds: 300,
@@ -27,12 +29,14 @@ const defaultConfig = {
 const configSchema = {
     databaseFile: 'string',
     globalDelay: 'number',
+    syncRequestDelayMs: 'number',
     maxFastRequests: 'number',
     maxRateLimitChannels: 'number',
     maxSyncPages: 'number',
     randomDelayMin: 'number',
     randomDelayMax: 'number',
     maxEventQueueSize: 'number',
+    maxQueueWorkers: 'number',
     deletedRetentionDays: 'number',
     downloadAttachments: 'boolean',
     downloadTimeoutSeconds: 'number',
@@ -71,6 +75,7 @@ function normalizeConfig(config) {
     }
 
     normalized.globalDelay = clamp(normalized.globalDelay, 50, 30000, defaultConfig.globalDelay);
+    normalized.syncRequestDelayMs = clamp(normalized.syncRequestDelayMs, 50, 5000, defaultConfig.syncRequestDelayMs);
     normalized.maxFastRequests = clamp(normalized.maxFastRequests, 1, 1000, defaultConfig.maxFastRequests);
     normalized.maxRateLimitChannels = clamp(normalized.maxRateLimitChannels, 100, 500000, defaultConfig.maxRateLimitChannels);
     normalized.maxSyncPages = clamp(normalized.maxSyncPages, 1, 1_000_000, defaultConfig.maxSyncPages);
@@ -80,6 +85,7 @@ function normalizeConfig(config) {
         normalized.randomDelayMax = normalized.randomDelayMin;
     }
     normalized.maxEventQueueSize = clamp(normalized.maxEventQueueSize, 100, 100000, defaultConfig.maxEventQueueSize);
+    normalized.maxQueueWorkers = clamp(normalized.maxQueueWorkers, 1, 20, defaultConfig.maxQueueWorkers);
     normalized.deletedRetentionDays = clamp(normalized.deletedRetentionDays, 1, 3650, defaultConfig.deletedRetentionDays);
     normalized.downloadTimeoutSeconds = clamp(normalized.downloadTimeoutSeconds, 1, 3600, defaultConfig.downloadTimeoutSeconds);
     normalized.retryAttempts = clamp(normalized.retryAttempts, 1, 10, defaultConfig.retryAttempts);
@@ -128,8 +134,9 @@ export async function saveConfig(config) {
 // ─── Database ─────────────────────────────────────────────────────────────────
 
 export function initDatabase(config) {
+    let db;
     try {
-        const db = new Database(config.databaseFile);
+        db = new Database(config.databaseFile);
 
         // Performance pragmas
         db.pragma('journal_mode = WAL');
@@ -164,6 +171,29 @@ export function initDatabase(config) {
             CREATE INDEX IF NOT EXISTS idx_author_id         ON messages (author_id);
         `);
 
+        // ── App settings KV store ────────────────────────────────────────────
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+        `);
+
+        // ── Schema migration tracking ────────────────────────────────────────
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                name       TEXT NOT NULL,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // ── Schema migrations ────────────────────────────────────────────────
+        // MUST run before the FTS triggers are created: the triggers reference
+        // the `deleted` column, so a legacy DB lacking it would make the whole
+        // FTS DDL throw and permanently disable FTS.
+        _runMigrations(db);
+
         let ftsEnabled = true;
         // ── FTS5 full-text search (discrawl-inspired) ────────────────────────
         // Uses content= so FTS rows reference the messages table by rowid.
@@ -186,16 +216,26 @@ export function initDatabase(config) {
                     VALUES (new.rowid, COALESCE(new.content, ''), COALESCE(new.author_tag, ''));
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                -- Hard delete: remove the row from FTS. Only fire when the row was
+                -- not already soft-deleted (its FTS entry is already gone then);
+                -- deleting a non-existent entry corrupts the FTS5 index.
+                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages
+                WHEN old.deleted = 0
+                BEGIN
                     INSERT INTO messages_fts(messages_fts, rowid, content, author_tag)
                     VALUES ('delete', old.rowid, COALESCE(old.content, ''), COALESCE(old.author_tag, ''));
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+                CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+                WHEN old.deleted = 0
+                BEGIN
                     INSERT INTO messages_fts(messages_fts, rowid, content, author_tag)
                     VALUES ('delete', old.rowid, COALESCE(old.content, ''), COALESCE(old.author_tag, ''));
+                    -- Only re-insert non-deleted rows; soft-deleted messages must
+                    -- stay out of the FTS index.
                     INSERT INTO messages_fts(rowid, content, author_tag)
-                    VALUES (new.rowid, COALESCE(new.content, ''), COALESCE(new.author_tag, ''));
+                    SELECT new.rowid, COALESCE(new.content, ''), COALESCE(new.author_tag, '')
+                    WHERE new.deleted = 0;
                 END;
             `);
         } catch (err) {
@@ -216,30 +256,59 @@ export function initDatabase(config) {
             );
         `);
 
-        // ── App settings KV store ────────────────────────────────────────────
-        db.exec(`
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-        `);
         setSetting(db, 'ftsEnabled', ftsEnabled);
 
-        // ── Schema migration tracking ────────────────────────────────────────
-        db.exec(`
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version    INTEGER PRIMARY KEY,
-                name       TEXT NOT NULL,
-                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-
-        // ── Schema migrations ────────────────────────────────────────────────
-        _runMigrations(db);
+        // Rebuild FTS index now that the table exists, if empty while messages
+        // table has rows (happens when upgrading from a version without FTS).
+        _rebuildFtsIfEmpty(db);
 
         return db;
     } catch (err) {
+        // Close the partially-opened handle so the fd/file lock is released.
+        // Otherwise a failed init (e.g. corrupt DB) leaks the handle and blocks
+        // cleanup/retry on Windows (EBUSY/EPERM).
+        try { db?.close(); } catch { /* already closed or never opened */ }
         throw new Error(`Database init failed: ${err.message}`);
+    }
+}
+
+function _rebuildFtsIfEmpty(db) {
+    try {
+        const msgCount = db.prepare('SELECT COUNT(*) as n FROM messages').get().n;
+        const ftsCount = db.prepare("SELECT COUNT(*) as n FROM messages_fts").get().n;
+        // Rebuild whenever the FTS index is missing live rows. A partial/aborted
+        // build leaves live rows out of FTS, and the update trigger's 'delete'
+        // command would then fire on absent entries (FTS5 corruption). Wrapping
+        // the build in a transaction keeps it atomic: an interrupted build rolls
+        // back so the next startup retries from scratch.
+        if (msgCount > 0 && ftsCount === 0) {
+            console.log(chalk.blue('🔍 Building FTS index for existing messages...'));
+            const liveCount = db.prepare('SELECT COUNT(*) as n FROM messages WHERE deleted = 0').get().n;
+            if (liveCount > 100_000) {
+                console.log(chalk.yellow(`   ${liveCount.toLocaleString()} messages — this may take a while...`));
+            }
+            const batchSize = 50_000;
+            const txn = db.transaction(() => {
+                // Clear any partial index first so we never double-insert.
+                db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('delete-all')`);
+                let offset = 0;
+                while (offset < liveCount) {
+                    const batch = Math.min(batchSize, liveCount - offset);
+                    db.exec(`INSERT INTO messages_fts(rowid, content, author_tag)
+                             SELECT rowid, COALESCE(content,''), COALESCE(author_tag,'')
+                             FROM messages WHERE deleted = 0 ORDER BY rowid LIMIT ${batch} OFFSET ${offset}`);
+                    offset += batch;
+                    const pct = Math.round((offset / liveCount) * 100);
+                    if (liveCount > 100_000 && pct % 25 === 0) {
+                        console.log(chalk.blue(`   FTS build: ${pct}% (${offset.toLocaleString()}/${liveCount.toLocaleString()})`));
+                    }
+                }
+            });
+            txn();
+            console.log(chalk.green(`✅ FTS index built (${liveCount.toLocaleString()} messages)`));
+        }
+    } catch {
+        // FTS table may not exist on very old DBs — that's fine, it was just created above
     }
 }
 
@@ -270,21 +339,6 @@ function _runMigrations(db) {
         }
     } catch (err) {
         console.warn(chalk.yellow('Migration warning:'), err.message);
-    }
-
-    // Rebuild FTS index if it exists but is empty while messages table has rows
-    // (happens when upgrading from a version without FTS)
-    try {
-        const msgCount = db.prepare('SELECT COUNT(*) as n FROM messages').get().n;
-        const ftsCount = db.prepare("SELECT COUNT(*) as n FROM messages_fts").get().n;
-        if (msgCount > 0 && ftsCount === 0) {
-            console.log(chalk.blue('🔍 Building FTS index for existing messages...'));
-            db.exec(`INSERT INTO messages_fts(rowid, content, author_tag)
-                     SELECT rowid, COALESCE(content,''), COALESCE(author_tag,'') FROM messages`);
-            console.log(chalk.green(`✅ FTS index built (${msgCount.toLocaleString()} messages)`));
-        }
-    } catch {
-        // FTS table may not exist yet on very old DBs — that's fine, it was just created above
     }
 }
 
