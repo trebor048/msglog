@@ -50,9 +50,10 @@ const UPSERT_SYNC_STATE = `
 `;
 
 const MARK_COMPLETE = `
-    UPDATE channel_sync_state
-    SET is_complete = 1, last_synced_at = datetime('now')
-    WHERE channel_id = ?
+    INSERT INTO channel_sync_state (channel_id, oldest_id, newest_id, total_fetched, last_synced_at, is_complete)
+    VALUES (?, NULL, NULL, 0, datetime('now'), 1)
+    ON CONFLICT(channel_id) DO UPDATE SET
+        is_complete = 1, last_synced_at = datetime('now')
 `;
 
 function loadSyncState(db, channelId) {
