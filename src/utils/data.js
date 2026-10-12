@@ -65,8 +65,9 @@ export class MessageSearch {
         const normalizedEndDate = normalizeEndDateInput(filters.endDate);
 
         if (filters.query) {
-            conditions.push('content LIKE ?');
-            params.push(`%${filters.query}%`);
+            const escapedQuery = filters.query.replace(/[%_\\]/g, '\\$&');
+            conditions.push("content LIKE ? ESCAPE '\\'");
+            params.push(`%${escapedQuery}%`);
         }
 
         if (filters.authorId) {

@@ -209,8 +209,8 @@ export class DatabaseScreen {
         const spinner = new TuiSpinner(this.widgets.output, msg);
         spinner.start();
         
-        // Use setImmediate to allow the spinner to render before blocking operation
-        await new Promise(resolve => setImmediate(resolve));
+        // Use setTimeout to allow the spinner to render before blocking operation
+        await new Promise(resolve => setTimeout(resolve, 50));
         if (this._destroyed) {
             // Screen gone while we waited — stop the spinner interval without
             // touching widgets (blessed tolerates setContent on detached nodes,

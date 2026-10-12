@@ -134,7 +134,7 @@ export class ViewChannelsScreen {
     }
 
     startUpdates() {
-        this.updateDisplay();
+        try { this.updateDisplay(); } catch {}
         this.updateInterval = setInterval(() => {
             try {
                 this.updateDisplay();

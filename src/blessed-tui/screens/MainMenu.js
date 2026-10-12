@@ -28,7 +28,7 @@ export class MainMenu {
 
         // Handle terminal resize — recalculate menu height
         this._resizeHandler = () => {
-            const newHeight = this.screen.height - 9;
+            const newHeight = this.screen.height - 8;
             if (newHeight >= 5) {
                 this.widgets.menu.height = newHeight;
                 this.screen.render();
@@ -98,7 +98,7 @@ export class MainMenu {
         this.widgets.menu = blessed.list({
             parent: this.widgets.main,
             top: 7, left: 0, width: '100%',
-            height: this.screen.height - 9,
+            height: this.screen.height - 8,
             border: border(COLORS.BORDER),
             tags: false,
             label: ' Menu ',
@@ -188,7 +188,7 @@ export class MainMenu {
     }
 
     startUpdates() {
-        this.updateStatus();
+        try { this.updateStatus(); } catch {}
         this.updateInterval = setInterval(() => {
             this.updateStatus();
 

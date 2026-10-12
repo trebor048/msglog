@@ -52,6 +52,7 @@ export class ScreenManager {
     destroy() {
         if (this.screen) {
             this.screen.destroy();
+            this.screen = null;
         }
     }
 }

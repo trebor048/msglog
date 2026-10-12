@@ -35,7 +35,10 @@ export function promptInput(screen, parent, label, defaultVal = '') {
         screen.render();
         input.focus();
 
+        let finished = false;
         const finish = (value) => {
+            if (finished) return;
+            finished = true;
             input.destroy();
             if (prevFocused && !prevFocused.destroyed) prevFocused.focus();
             screen.render();
@@ -86,7 +89,10 @@ export function confirmDialog(screen, parent, message) {
         dialog.focus();
         screen.render();
 
+        let finished = false;
         const finish = (value) => {
+            if (finished) return;
+            finished = true;
             dialog.destroy();
             if (prevFocused && !prevFocused.destroyed) prevFocused.focus();
             screen.render();

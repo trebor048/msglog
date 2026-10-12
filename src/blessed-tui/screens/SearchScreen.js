@@ -279,7 +279,7 @@ export class SearchScreen {
             return;
         }
 
-        let content = `\n{cyan-fg}{bold}${safeTitle}{/bold}{/cyan-fg} {gray-fg}(${results.length} results){/gray-fg}\n`;
+        let content = `\n{cyan-fg}{bold}${safeTitle}{/bold}{/cyan-fg} {gray-fg}(${Math.min(results.length, 50)} of ${results.length} results){/gray-fg}\n`;
         content += '{gray-fg}' + '─'.repeat(60) + '{/gray-fg}\n';
 
         results.slice(0, 50).forEach(msg => {

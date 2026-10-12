@@ -138,10 +138,15 @@ export class ExportScreen {
 
             // Strip known extensions to prevent double-extension
             let clean = Validator.sanitizeFilename(value);
-            for (const ext of STRIP_EXTENSIONS) {
-                if (clean.toLowerCase().endsWith(ext.toLowerCase())) {
-                    clean = clean.slice(0, -ext.length);
-                    break;
+            let stripped = true;
+            while (stripped) {
+                stripped = false;
+                for (const ext of STRIP_EXTENSIONS) {
+                    if (clean.toLowerCase().endsWith(ext.toLowerCase())) {
+                        clean = clean.slice(0, -ext.length);
+                        stripped = true;
+                        break;
+                    }
                 }
             }
             const filename = clean + cfg.ext;

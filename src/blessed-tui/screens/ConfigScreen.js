@@ -336,6 +336,7 @@ export class ConfigScreen {
             input.destroy();
             this.screen.render();
             Promise.resolve(callback(val)).catch(err => {
+                if (this._destroyed) return;
                 this.widgets.output.setContent(`\n{red-fg}Save failed: ${Validator.sanitizeErrorMessage(err)}{/red-fg}`);
                 this.widgets.menu.focus();
                 this.screen.render();

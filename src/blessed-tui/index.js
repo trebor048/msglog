@@ -34,6 +34,7 @@ function redirectConsoleToFile() {
 
     let currentLogFile = getRotatedLogFile();
     let stream = fs.createWriteStream(currentLogFile, { flags: 'a' });
+    stream.on('error', () => {});
 
     // Patterns that indicate sensitive data — truncate these lines
     const SENSITIVE_PATTERNS = [

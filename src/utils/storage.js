@@ -101,14 +101,14 @@ export class MessageStore {
         }
     }
 
-    async buildAttachmentData(message, downloadAttachmentFn) {
+    async buildAttachmentData(message, downloadAttachmentFn, withRetry) {
         if (!this.config.downloadAttachments || message.attachments.size === 0)
             return [...message.attachments.values()].map(a => ({ url: a.url, filename: a.name, size: a.size }));
 
         const results = [];
         for (const a of message.attachments.values()) {
             try {
-                const localPath = await downloadAttachmentFn(a.url, message.channel.id, a.name, message.id, a.size);
+                const localPath = await downloadAttachmentFn(a.url, message.channel.id, a.name, withRetry, this.config, message.id, a.size);
                 if (localPath && this.performance) this.performance.stats.totalAttachmentsDownloaded++;
                 results.push(localPath
                     ? { originalUrl: a.url, localPath, filename: a.name, size: a.size }
@@ -140,9 +140,9 @@ export class MessageStore {
                 if (!msg.author) continue;
                 try {
                     const refContent = await this.fetchReferenceContent(msg, channel, withRetry);
-                    const attachmentData = await this.buildAttachmentData(msg, downloadAttachmentFn);
+                    const attachmentData = await this.buildAttachmentData(msg, downloadAttachmentFn, withRetry);
                     const processedEmbeds = processEmbedsFn
-                        ? await processEmbedsFn(msg.embeds, msg.channel.id, msg.id)
+                        ? await processEmbedsFn(msg.embeds, msg.channel.id, downloadAttachmentFn, this.config, msg.id, withRetry)
                         : msg.embeds;
 
                     rows.push({
@@ -313,8 +313,16 @@ export class MessageStore {
     checkMemoryUsage() {
         const heapUsedMB = process.memoryUsage().heapUsed / 1024 / 1024;
         if (heapUsedMB > 500 && global.gc) global.gc();
-        if (this.referenceCache.size > this.config.maxReferenceCache) this.referenceCache.clear();
-        if (this.failedReferences.size > this.config.maxFailedReferences) this.failedReferences.clear();
+        if (this.referenceCache.size > this.config.maxReferenceCache) {
+            const excess = this.referenceCache.size - this.config.maxReferenceCache;
+            const keys = [...this.referenceCache.keys()].slice(0, excess);
+            keys.forEach(k => this.referenceCache.delete(k));
+        }
+        if (this.failedReferences.size > this.config.maxFailedReferences) {
+            const excess = this.failedReferences.size - this.config.maxFailedReferences;
+            const keys = [...this.failedReferences.keys()].slice(0, excess);
+            keys.forEach(k => this.failedReferences.delete(k));
+        }
     }
 
     _getMostRecentStmt = null;
@@ -525,8 +533,14 @@ export async function downloadAttachment(url, channelId, filename, withRetry, co
                     return filePath;
                 }
             } else {
-                console.log(chalk.blue(`📁 File already exists: ${filename}`));
-                return filePath;
+                const existing = await fs.stat(filePath).catch(() => null);
+                if (existing && existing.size > 0) {
+                    console.log(chalk.blue(`📁 File already exists: ${filename}`));
+                    return filePath;
+                }
+                if (existing) {
+                    await fs.unlink(filePath).catch(() => {});
+                }
             }
         } catch {
             // File doesn't exist, proceed
@@ -559,9 +573,10 @@ export async function downloadAttachment(url, channelId, filename, withRetry, co
                 // otherwise partial files persist on Windows.
                 try { response.data.destroy(); } catch {}
                 try { writer.destroy(); } catch {}
-                setTimeout(() => {
+                const timer = setTimeout(() => {
                     fs.unlink(tmpPath).catch(() => {});
                 }, 100);
+                if (typeof timer.unref === 'function') timer.unref();
                 reject(err);
             };
 
@@ -601,7 +616,7 @@ export async function downloadAttachment(url, channelId, filename, withRetry, co
     }
 }
 
-export async function processEmbeds(embeds, channelId, downloadAttachmentFn, config, messageId = '') {
+export async function processEmbeds(embeds, channelId, downloadAttachmentFn, config, messageId = '', withRetry = null) {
     if (!config.downloadAttachments || !embeds?.length) return embeds;
 
     const seenUrls = new Set();
@@ -618,7 +633,7 @@ export async function processEmbeds(embeds, channelId, downloadAttachmentFn, con
             if (!url || seenUrls.has(url)) continue;
             const filename = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}.${getFileExtension(url)}`;
             try {
-                const localPath = await downloadAttachmentFn(url, channelId, filename, messageId);
+                const localPath = await downloadAttachmentFn(url, channelId, filename, withRetry, config, messageId);
                 // Only dedup on success: a failed download shouldn't block a later
                 // embed (or later key) from retrying the same URL, and a successful
                 // download should be reusable by later embeds with the same URL.

@@ -107,7 +107,7 @@ async function bootstrap() {
         const wrappedProcessEmbeds = (embeds, channelId, messageId) =>
             processEmbeds(embeds, channelId,
                 (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId),
-                config, messageId);
+                config, messageId, withRetry);
 
         const syncEngine = new SyncEngine(jobManager, messageStore, rateLimiter, config, wrappedDownloadAttachment, wrappedProcessEmbeds, performance);
         const search = new MessageSearch(db, performance);
@@ -149,10 +149,10 @@ async function bootstrap() {
                 withRetry,
                 (url, channelId, filename, messageId, size) =>
                     downloadAttachment(url, channelId, filename, withRetry, config, messageId, size),
-                (embeds, channelId, messageId) =>
-                    processEmbeds(embeds, channelId,
-                        (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId),
-                        config, messageId),
+                 (embeds, channelId, messageId) =>
+                     processEmbeds(embeds, channelId,
+                         (url, cId, fn, mId) => downloadAttachment(url, cId, fn, withRetry, config, mId),
+                         config, messageId, withRetry),
                 // Realtime path gates on pause (not shutdown): the shutdown drain
                 // must still be able to write queued messages before the DB closes.
                 () => ctx.isPaused

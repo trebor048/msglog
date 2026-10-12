@@ -142,7 +142,7 @@ export class BlessedTUIApp {
             // Re-focus current screen's main interactive widget
             if (this.currentScreen?.widgets) {
                 const w = this.currentScreen.widgets;
-                (w.menu || w.jobList || w.list || w.table || w.health || w.content || w.main)?.focus();
+                (w.menu || w.jobList || w.list || w.table || w.health || w.content)?.focus();
             }
         };
         this._helpClose = close;
@@ -240,13 +240,13 @@ export class BlessedTUIApp {
         this.ctx.isPaused = !this.ctx.isPaused;
 
         if (!this.ctx.isPaused && this.ctx.listeningChannels.size) {
-            this.ctx.syncEngine.syncAllChannelsParallel(
+            Promise.resolve().then(() => this.ctx.syncEngine.syncAllChannelsParallel(
                 this.ctx.client,
                 this.ctx.listeningChannels,
                 this.ctx.withRetry,
                 () => this.ctx.isShuttingDown,
                 () => this.ctx.isPaused
-            ).catch(err => console.error('Sync error:', err));
+            )).catch(err => console.error('Sync error:', err));
             this.showLiveMonitor();
             return;
         }

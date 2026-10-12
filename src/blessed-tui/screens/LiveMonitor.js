@@ -170,6 +170,10 @@ export class LiveMonitor {
                 // so the newest-job auto-jump can't steal the cursor later.
                 if (!this._autoSelecting && jobs[index].id !== this.selectedJobId) {
                     this._userSelectedJobId = jobs[index].id;
+                } else if (this._userSelectedJobId && jobs[index].id !== this._userSelectedJobId) {
+                    // User navigated away from their manually selected job — reset
+                    // so auto-jump can work again for new jobs.
+                    this._userSelectedJobId = null;
                 }
                 this.selectedJobId = jobs[index].id;
                 // Reset auto-scroll for a freshly-selected running job
@@ -188,6 +192,7 @@ export class LiveMonitor {
     }
 
     formatElapsed(ms) {
+        if (!ms || ms < 0) return '0s';
         if (ms < 1000) return `${ms}ms`;
         const s = Math.floor(ms / 1000);
         if (s < 60) return `${s}s`;
@@ -234,7 +239,7 @@ export class LiveMonitor {
         const fpItems = items.map(it =>
             it.replace(/\{[^}]*\}/g, '')               // strip blessed tags
               .replace(this._spinnerFramesRe, '[X]')   // normalize spinner glyph (braille OR ASCII)
-              .replace(/\d+ms|\d+s|\d+m \d+s/g, 'T')   // normalize elapsed
+              .replace(/\d+ms$|\d+s$|\d+m \d+s$/g, 'T') // normalize elapsed (anchored to end)
         );
         const newItemsFp = JSON.stringify(fpItems);
         if (newItemsFp === this._lastJobItems) {
@@ -453,6 +458,13 @@ export class LiveMonitor {
                 );
             }
             allJobs.forEach(j => this._seenJobIds.add(j.id));
+            // Prune _seenJobIds to prevent unbounded growth
+            if (this._seenJobIds.size > 1000) {
+                const idsToKeep = new Set(allJobs.map(j => j.id));
+                for (const id of this._seenJobIds) {
+                    if (!idsToKeep.has(id)) this._seenJobIds.delete(id);
+                }
+            }
 
             const statusLabel = isPaused ? '{yellow-fg}PAUSED{/yellow-fg}' : '{green-fg}ACTIVE{/green-fg}';
             this.widgets.summary.setContent(

@@ -87,7 +87,7 @@ export class HealthScreen {
 
         const heapUsed = healthStatus.memoryUsage.heapUsed / 1024 / 1024;
         const heapTotal = healthStatus.memoryUsage.heapTotal / 1024 / 1024;
-        const memPercent = Math.floor((heapUsed / heapTotal) * 100);
+        const memPercent = heapTotal > 0 ? Math.floor((heapUsed / heapTotal) * 100) : 0;
         const memColor = memPercent > 80 ? 'red' : memPercent > 50 ? 'yellow' : 'green';
 
         const cbState = String(healthStatus.circuitBreaker?.state ?? 'unknown');
@@ -140,7 +140,7 @@ export class HealthScreen {
     }
 
     startUpdates() {
-        this.updateHealth();
+        try { this.updateHealth(); } catch {}
         this.updateInterval = setInterval(() => {
             try {
                 this.updateHealth();
